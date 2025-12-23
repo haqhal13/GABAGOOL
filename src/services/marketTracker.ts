@@ -31,6 +31,46 @@ class MarketTracker {
     private lastMarketCount = 0;
 
     /**
+     * Check if market is ETH-UpDown-15 or BTC-UpDown-15 type
+     * Returns normalized key like "ETH-UpDown-15" or "BTC-UpDown-15" if it matches, null otherwise
+     */
+    private getUpDown15MarketType(activity: any): string | null {
+        const rawTitle =
+            activity?.slug ||
+            activity?.eventSlug ||
+            activity?.title ||
+            activity?.asset ||
+            '';
+        
+        if (!rawTitle) return null;
+        
+        const titleLower = rawTitle.toLowerCase();
+        
+        // Check for 15-minute timeframe first
+        const has15Min = /\b15\s*min|\b15min|updown.*?15|15.*?updown/i.test(rawTitle);
+        
+        if (!has15Min) {
+            return null;
+        }
+        
+        // Check for UpDown pattern (up/down/updown)
+        const hasUpDown = /up.*?down|down.*?up|updown/i.test(rawTitle);
+        
+        if (hasUpDown || has15Min) {
+            // Check for Bitcoin
+            if (titleLower.includes('bitcoin') || titleLower.includes('btc') || /^btc/i.test(rawTitle)) {
+                return 'BTC-UpDown-15';
+            }
+            // Check for Ethereum
+            if (titleLower.includes('ethereum') || titleLower.includes('eth') || /^eth/i.test(rawTitle)) {
+                return 'ETH-UpDown-15';
+            }
+        }
+        
+        return null;
+    }
+
+    /**
      * Extract market key from activity
      * Priority:
      * 1) conditionId (most stable per market)
@@ -38,6 +78,12 @@ class MarketTracker {
      * 3) title / asset fallback
      */
     private extractMarketKey(activity: any): string {
+        // Check for ETH-UpDown-15 or BTC-UpDown-15 markets first
+        const upDown15Type = this.getUpDown15MarketType(activity);
+        if (upDown15Type) {
+            return upDown15Type; // Normalized key for UpDown-15 markets
+        }
+
         if (activity?.conditionId) {
             const slugPart = (activity?.slug || activity?.eventSlug || activity?.title || '').substring(0, 30);
             return `CID-${activity.conditionId}-${slugPart}`;
@@ -152,6 +198,86 @@ class MarketTracker {
     }
 
     /**
+     * Check if a time-window market has passed (e.g., "10:30-10:45" where current time > 10:45)
+     * Assumes times are in ET/EST timezone
+     */
+    private isTimeWindowMarketPassed(marketName: string): boolean {
+        const timeWindow = this.extractTimeWindow(marketName);
+        if (!timeWindow) {
+            return false; // Not a time-window market, can't determine if passed
+        }
+
+        try {
+            // Extract end time (e.g., "10:45" from "10:30-10:45")
+            const parts = timeWindow.split(/[-–]/);
+            if (parts.length !== 2) {
+                return false;
+            }
+
+            const endTimeStr = parts[1].trim();
+            
+            // Parse the end time
+            // Handle formats like "10:45", "10:45AM", "10:45 PM", etc.
+            const hasAMPM = /[AP]M/i.test(endTimeStr);
+            const cleaned = endTimeStr.replace(/\s*[AP]M/i, '').trim();
+            const timeParts = cleaned.split(':');
+            
+            if (timeParts.length !== 2) {
+                return false;
+            }
+
+            let hours = parseInt(timeParts[0], 10);
+            const minutes = parseInt(timeParts[1], 10);
+            
+            if (isNaN(hours) || isNaN(minutes)) {
+                return false;
+            }
+
+            // Handle 12-hour format
+            if (hasAMPM) {
+                const isPM = /PM/i.test(endTimeStr);
+                if (isPM && hours !== 12) {
+                    hours += 12;
+                } else if (!isPM && hours === 12) {
+                    hours = 0;
+                }
+            }
+
+            // Get current time in ET/EST
+            // Use Intl.DateTimeFormat to get ET time (handles EST/EDT automatically)
+            const now = new Date();
+            const etFormatter = new Intl.DateTimeFormat('en-US', {
+                timeZone: 'America/New_York',
+                hour: '2-digit',
+                minute: '2-digit',
+                hour12: false,
+            });
+            
+            // Format as "HH:mm" and parse
+            const etTimeStr = etFormatter.format(now);
+            const [etHoursStr, etMinutesStr] = etTimeStr.split(':');
+            const etHours = parseInt(etHoursStr || '0', 10);
+            const etMinutes = parseInt(etMinutesStr || '0', 10);
+            const currentTotalMinutes = etHours * 60 + etMinutes;
+            const endTotalMinutes = hours * 60 + minutes;
+
+            // Check if end time has passed today
+            // If end time is early (e.g., 1:00 AM) and current time is late (e.g., 11:00 PM),
+            // assume the market ended yesterday, so it's definitely passed
+            if (endTotalMinutes < 6 * 60 && currentTotalMinutes > 18 * 60) {
+                // End time is before 6 AM and current time is after 6 PM - market likely ended yesterday
+                return true;
+            }
+
+            // Otherwise, check if current time is past end time
+            return currentTotalMinutes > endTotalMinutes;
+        } catch (e) {
+            // If we can't parse, assume market hasn't passed (safer to show than hide)
+            return false;
+        }
+    }
+
+    /**
      * Get base market name without time window (e.g., "Bitcoin Up or Down" from "Bitcoin Up or Down - 10:15-10:30")
      */
     private getBaseMarketName(marketName: string): string {
@@ -161,6 +287,52 @@ class MarketTracker {
             return marketName.replace(new RegExp(`\\s*[-–]\\s*${timeWindow.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'i'), '').trim();
         }
         return marketName;
+    }
+
+    /**
+     * Remove older ETH-UpDown-15 or BTC-UpDown-15 markets when a new one appears
+     * Ensures only the most recent market of each type is kept
+     * This checks all existing markets to find any UpDown-15 markets of the same type
+     */
+    private removeOlderUpDown15Markets(newMarketKey: string, newMarketActivity: any): void {
+        // Only process if this is an UpDown-15 market
+        if (newMarketKey !== 'ETH-UpDown-15' && newMarketKey !== 'BTC-UpDown-15') {
+            return;
+        }
+
+        const marketsToRemove: string[] = [];
+        const newMarketTimestamp = newMarketActivity?.timestamp 
+            ? (newMarketActivity.timestamp * 1000) // Convert from seconds to milliseconds
+            : Date.now();
+
+        // Check all existing markets to find UpDown-15 markets of the same type
+        for (const [key, market] of this.markets.entries()) {
+            // Skip if it's the same key - we'll update it, not remove it
+            if (key === newMarketKey) {
+                continue;
+            }
+
+            // Check if this existing market is also an UpDown-15 market of the same type
+            const existingUpDown15Type = this.getUpDown15MarketType({
+                slug: market.marketName,
+                title: market.marketName,
+                eventSlug: market.marketName,
+            });
+
+            if (existingUpDown15Type === newMarketKey) {
+                // Found an UpDown-15 market of the same type
+                // Remove it if it's older than the new market
+                // Compare by lastUpdate timestamp
+                if (market.lastUpdate < newMarketTimestamp) {
+                    marketsToRemove.push(key);
+                }
+            }
+        }
+
+        // Remove older markets
+        for (const key of marketsToRemove) {
+            this.markets.delete(key);
+        }
     }
 
     /**
@@ -279,6 +451,11 @@ class MarketTracker {
         const side = activity.side?.toUpperCase() || 'BUY';
 
         const isNewMarket = !this.markets.has(marketKey);
+        
+        // Remove older UpDown-15 markets before adding/updating
+        // Always check, even if market exists, to catch older markets with different keys
+        this.removeOlderUpDown15Markets(marketKey, activity);
+        
         let market = this.markets.get(marketKey);
         
         if (!market) {
@@ -413,7 +590,7 @@ class MarketTracker {
             return;
         }
 
-        // Filter out closed markets (where endDate has passed)
+        // Filter out closed markets (where endDate has passed or time window has passed)
         // Keep markets stable - only remove if they're actually closed
         // Fallback: if market hasn't been updated in 7 days, consider it stale/closed
         const STALE_MARKET_THRESHOLD = 7 * 24 * 60 * 60 * 1000; // 7 days in milliseconds
@@ -422,6 +599,10 @@ class MarketTracker {
             // If market has an endDate and it has passed, consider it closed
             if (m.endDate && now > m.endDate) {
                 return false; // Market is closed
+            }
+            // Check if time-window market has passed (e.g., "10:30-10:45" where current time > 10:45)
+            if (this.isTimeWindowMarketPassed(m.marketName)) {
+                return false; // Market time window has passed
             }
             // Fallback: if market hasn't been updated in a very long time, consider it stale
             if (now - m.lastUpdate > STALE_MARKET_THRESHOLD) {
@@ -434,8 +615,9 @@ class MarketTracker {
         // Remove closed/stale markets from tracking
         for (const [key, value] of this.markets.entries()) {
             const isClosed = value.endDate && now > value.endDate;
+            const isTimeWindowPassed = this.isTimeWindowMarketPassed(value.marketName);
             const isStale = now - value.lastUpdate > STALE_MARKET_THRESHOLD;
-            if (isClosed || isStale) {
+            if (isClosed || isTimeWindowPassed || isStale) {
                 this.markets.delete(key);
             }
         }

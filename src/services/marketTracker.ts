@@ -13,6 +13,8 @@ interface MarketStats {
     tradesUp: number;
     tradesDown: number;
     lastUpdate: number;
+    endDate?: number; // Market end date timestamp (if available)
+    conditionId?: string; // Condition ID for market lookup
 }
 
 class MarketTracker {
@@ -186,6 +188,8 @@ class MarketTracker {
                 tradesUp: 0,
                 tradesDown: 0,
                 lastUpdate: Date.now(),
+                endDate: activity.endDate ? activity.endDate * 1000 : undefined, // Convert to milliseconds
+                conditionId: activity.conditionId,
             };
             this.markets.set(marketKey, market);
             
@@ -197,6 +201,14 @@ class MarketTracker {
             // If the first trade is SELL, still register the market but don't accumulate
             if (side !== 'BUY') {
                 return;
+            }
+        } else {
+            // Update endDate and conditionId if available and not already set
+            if (activity.endDate && !market.endDate) {
+                market.endDate = activity.endDate * 1000; // Convert to milliseconds
+            }
+            if (activity.conditionId && !market.conditionId) {
+                market.conditionId = activity.conditionId;
             }
         }
 
@@ -241,23 +253,35 @@ class MarketTracker {
             return;
         }
 
-        // Prune / hide stale markets (likely closed) based on last update
-        const maxAgeMs = ENV.DISPLAY_MAX_AGE_MINUTES
-            ? ENV.DISPLAY_MAX_AGE_MINUTES * 60 * 1000
-            : (ENV.TOO_OLD_TIMESTAMP || 24) * 60 * 60 * 1000; // default 24h
-        const freshMarkets = Array.from(this.markets.values()).filter(
-            (m) => now - m.lastUpdate <= maxAgeMs
-        );
+        // Filter out closed markets (where endDate has passed)
+        // Keep markets stable - only remove if they're actually closed
+        // Fallback: if market hasn't been updated in 7 days, consider it stale/closed
+        const STALE_MARKET_THRESHOLD = 7 * 24 * 60 * 60 * 1000; // 7 days in milliseconds
+        
+        const activeMarkets = Array.from(this.markets.values()).filter((m) => {
+            // If market has an endDate and it has passed, consider it closed
+            if (m.endDate && now > m.endDate) {
+                return false; // Market is closed
+            }
+            // Fallback: if market hasn't been updated in a very long time, consider it stale
+            if (now - m.lastUpdate > STALE_MARKET_THRESHOLD) {
+                return false; // Market is stale/closed
+            }
+            // Keep all other markets (stable dashboard)
+            return true;
+        });
 
-        if (freshMarkets.length === 0) {
-            return;
-        }
-
-        // Remove stale entries to avoid display clutter
+        // Remove closed/stale markets from tracking
         for (const [key, value] of this.markets.entries()) {
-            if (now - value.lastUpdate > maxAgeMs) {
+            const isClosed = value.endDate && now > value.endDate;
+            const isStale = now - value.lastUpdate > STALE_MARKET_THRESHOLD;
+            if (isClosed || isStale) {
                 this.markets.delete(key);
             }
+        }
+
+        if (activeMarkets.length === 0) {
+            return;
         }
 
         // Stable dashboard: clear screen and redraw
@@ -269,7 +293,7 @@ class MarketTracker {
         console.log(''); // Empty line
 
         // Sort markets by total invested (descending)
-        const sortedMarkets = freshMarkets
+        const sortedMarkets = activeMarkets
             .sort((a, b) => {
                 const totalA = a.investedUp + a.investedDown;
                 const totalB = b.investedUp + b.investedDown;

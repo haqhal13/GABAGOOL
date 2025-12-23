@@ -2,6 +2,27 @@ import * as dotenv from 'dotenv';
 import { CopyStrategy, CopyStrategyConfig, parseTieredMultipliers } from './copyStrategy';
 dotenv.config();
 
+// Default trader to watch if USER_ADDRESSES isn't provided
+const DEFAULT_USER_ADDRESSES = '0x6031b6eed1c97e853c6e0f03ad3ce3529351f96d';
+
+// Default network endpoints for read-only mode
+const DEFAULTS = {
+    USER_ADDRESSES: DEFAULT_USER_ADDRESSES,
+    TRACK_ONLY_MODE: 'true',
+    CLOB_HTTP_URL: 'https://clob.polymarket.com/',
+    CLOB_WS_URL: 'wss://ws-subscriptions-clob.polymarket.com/ws',
+    RPC_URL: 'https://polygon-rpc.com',
+    USDC_CONTRACT_ADDRESS: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174',
+};
+
+// Provide sensible defaults so the bot can start in watch-only mode without a .env
+for (const [key, value] of Object.entries(DEFAULTS)) {
+    if (!process.env[key]) {
+        console.log(`ℹ️  ${key} not set; defaulting to ${value}`);
+        process.env[key] = value;
+    }
+}
+
 /**
  * Validate Ethereum address format
  */

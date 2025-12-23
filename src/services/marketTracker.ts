@@ -1,4 +1,6 @@
 import chalk from 'chalk';
+import * as fs from 'fs';
+import * as path from 'path';
 import { ENV } from '../config/env';
 import fetchData from '../utils/fetchData';
 
@@ -29,6 +31,184 @@ class MarketTracker {
     // Stable dashboard: update every 2s unless new market forces immediate refresh
     private displayInterval = 2000;
     private lastMarketCount = 0;
+    private loggedMarkets: Set<string> = new Set(); // Track markets already logged to CSV
+    private csvFilePath: string;
+
+    constructor() {
+        // Initialize CSV file path in logs directory
+        const logsDir = path.join(process.cwd(), 'logs');
+        if (!fs.existsSync(logsDir)) {
+            fs.mkdirSync(logsDir, { recursive: true });
+        }
+        this.csvFilePath = path.join(logsDir, 'market_pnl.csv');
+        this.initializeCsvFile();
+    }
+
+    /**
+     * Initialize CSV file with headers if it doesn't exist
+     */
+    private initializeCsvFile(): void {
+        if (!fs.existsSync(this.csvFilePath)) {
+            const headers = [
+                'Timestamp',
+                'Date',
+                'Market Key',
+                'Market Name',
+                'Condition ID',
+                'Invested Up ($)',
+                'Invested Down ($)',
+                'Total Invested ($)',
+                'Shares Up',
+                'Shares Down',
+                'Final Price Up ($)',
+                'Final Price Down ($)',
+                'Final Value Up ($)',
+                'Final Value Down ($)',
+                'Total Final Value ($)',
+                'PnL Up ($)',
+                'PnL Down ($)',
+                'Total PnL ($)',
+                'PnL Percent (%)',
+                'Trades Up',
+                'Trades Down',
+                'Outcome'
+            ].join(',');
+            fs.writeFileSync(this.csvFilePath, headers + '\n', 'utf8');
+        }
+    }
+
+    /**
+     * Fetch final prices for a closed market
+     */
+    private async fetchFinalPrices(market: MarketStats): Promise<{ priceUp?: number; priceDown?: number }> {
+        const prices: { priceUp?: number; priceDown?: number } = {};
+
+        try {
+            // Try to get final prices from positions of tracked traders
+            for (const traderAddress of ENV.USER_ADDRESSES) {
+                try {
+                    const positions = await fetchData(
+                        `https://data-api.polymarket.com/positions?user=${traderAddress}`
+                    ).catch(() => null);
+
+                    if (Array.isArray(positions)) {
+                        for (const pos of positions) {
+                            if (market.assetUp && pos.asset === market.assetUp && pos.curPrice !== undefined) {
+                                prices.priceUp = parseFloat(pos.curPrice);
+                            }
+                            if (market.assetDown && pos.asset === market.assetDown && pos.curPrice !== undefined) {
+                                prices.priceDown = parseFloat(pos.curPrice);
+                            }
+                        }
+                    }
+                } catch (e) {
+                    // Continue to next trader
+                }
+            }
+
+            // If we have current prices from the market, use those as fallback
+            if (prices.priceUp === undefined && market.currentPriceUp !== undefined) {
+                prices.priceUp = market.currentPriceUp;
+            }
+            if (prices.priceDown === undefined && market.currentPriceDown !== undefined) {
+                prices.priceDown = market.currentPriceDown;
+            }
+        } catch (e) {
+            // Silently fail - will use current prices if available
+        }
+
+        return prices;
+    }
+
+    /**
+     * Log closed market PnL to CSV file
+     */
+    private async logClosedMarketPnL(market: MarketStats): Promise<void> {
+        // Skip if already logged
+        if (this.loggedMarkets.has(market.marketKey)) {
+            return;
+        }
+
+        // Fetch final prices
+        const finalPrices = await this.fetchFinalPrices(market);
+
+        // Calculate final values and PnL
+        const totalInvested = market.investedUp + market.investedDown;
+        
+        let finalValueUp = 0;
+        let finalValueDown = 0;
+        let pnlUp = 0;
+        let pnlDown = 0;
+
+        const finalPriceUp = finalPrices.priceUp ?? market.currentPriceUp ?? 0;
+        const finalPriceDown = finalPrices.priceDown ?? market.currentPriceDown ?? 0;
+
+        if (market.sharesUp > 0 && finalPriceUp > 0) {
+            finalValueUp = market.sharesUp * finalPriceUp;
+            pnlUp = finalValueUp - market.investedUp;
+        }
+
+        if (market.sharesDown > 0 && finalPriceDown > 0) {
+            finalValueDown = market.sharesDown * finalPriceDown;
+            pnlDown = finalValueDown - market.investedDown;
+        }
+
+        const totalFinalValue = finalValueUp + finalValueDown;
+        const totalPnl = pnlUp + pnlDown;
+        const pnlPercent = totalInvested > 0 ? (totalPnl / totalInvested) * 100 : 0;
+
+        // Determine outcome
+        let outcome = 'Unknown';
+        if (finalPriceUp >= 0.99) {
+            outcome = 'UP Won';
+        } else if (finalPriceUp <= 0.01) {
+            outcome = 'UP Lost';
+        } else if (finalPriceDown >= 0.99) {
+            outcome = 'DOWN Won';
+        } else if (finalPriceDown <= 0.01) {
+            outcome = 'DOWN Lost';
+        } else if (totalPnl > 0) {
+            outcome = 'Profit';
+        } else if (totalPnl < 0) {
+            outcome = 'Loss';
+        }
+
+        // Create CSV row
+        const timestamp = Date.now();
+        const date = new Date().toISOString();
+        const row = [
+            timestamp,
+            date,
+            market.marketKey,
+            `"${market.marketName.replace(/"/g, '""')}"`, // Escape quotes in market name
+            market.conditionId || '',
+            market.investedUp.toFixed(2),
+            market.investedDown.toFixed(2),
+            totalInvested.toFixed(2),
+            market.sharesUp.toFixed(4),
+            market.sharesDown.toFixed(4),
+            finalPriceUp.toFixed(4),
+            finalPriceDown.toFixed(4),
+            finalValueUp.toFixed(2),
+            finalValueDown.toFixed(2),
+            totalFinalValue.toFixed(2),
+            pnlUp.toFixed(2),
+            pnlDown.toFixed(2),
+            totalPnl.toFixed(2),
+            pnlPercent.toFixed(2),
+            market.tradesUp,
+            market.tradesDown,
+            outcome
+        ].join(',');
+
+        // Append to CSV file
+        try {
+            fs.appendFileSync(this.csvFilePath, row + '\n', 'utf8');
+            this.loggedMarkets.add(market.marketKey);
+        } catch (error) {
+            console.error(`Failed to write PnL to CSV: ${error}`);
+        }
+    }
 
     /**
      * Check if market is ETH-UpDown-15 or BTC-UpDown-15 type
@@ -634,14 +814,29 @@ class MarketTracker {
             return true;
         });
 
-        // Remove closed/stale markets from tracking
+        // Remove closed/stale markets from tracking and log PnL
+        const closedMarkets: MarketStats[] = [];
         for (const [key, value] of this.markets.entries()) {
             const isClosed = value.endDate && now > value.endDate;
             const isTimeWindowPassed = this.isTimeWindowMarketPassed(value.marketName);
             const isStale = now - value.lastUpdate > STALE_MARKET_THRESHOLD;
             if (isClosed || isTimeWindowPassed || isStale) {
+                // Only log markets that have actual investment (not just stale with no trades)
+                if (value.investedUp > 0 || value.investedDown > 0) {
+                    closedMarkets.push(value);
+                }
                 this.markets.delete(key);
             }
+        }
+
+        // Log closed markets to CSV (async, don't wait)
+        if (closedMarkets.length > 0) {
+            // Log each closed market
+            closedMarkets.forEach(market => {
+                this.logClosedMarketPnL(market).catch(err => {
+                    console.error(`Failed to log closed market ${market.marketKey}: ${err}`);
+                });
+            });
         }
 
         // Update market count after filtering

@@ -80,31 +80,38 @@ export const performHealthCheck = async (): Promise<HealthCheckResult> => {
         };
     }
 
-    // Check USDC balance
-    try {
-        const balance = await getMyBalance(ENV.PROXY_WALLET);
-        if (balance > 0) {
-            if (balance < 10) {
-                checks.balance = {
-                    status: 'warning',
-                    message: `Low balance: $${balance.toFixed(2)}`,
-                    balance,
-                };
-            } else {
-                checks.balance = {
-                    status: 'ok',
-                    message: `Balance: $${balance.toFixed(2)}`,
-                    balance,
-                };
-            }
-        } else {
-            checks.balance = { status: 'error', message: 'Zero balance' };
-        }
-    } catch (error) {
+    // Check USDC balance (skip in track-only mode)
+    if (ENV.TRACK_ONLY_MODE) {
         checks.balance = {
-            status: 'error',
-            message: `Balance check failed: ${error instanceof Error ? error.message : String(error)}`,
+            status: 'ok',
+            message: 'Skipped (track-only mode)',
         };
+    } else {
+        try {
+            const balance = await getMyBalance(ENV.PROXY_WALLET);
+            if (balance > 0) {
+                if (balance < 10) {
+                    checks.balance = {
+                        status: 'warning',
+                        message: `Low balance: $${balance.toFixed(2)}`,
+                        balance,
+                    };
+                } else {
+                    checks.balance = {
+                        status: 'ok',
+                        message: `Balance: $${balance.toFixed(2)}`,
+                        balance,
+                    };
+                }
+            } else {
+                checks.balance = { status: 'error', message: 'Zero balance' };
+            }
+        } catch (error) {
+            checks.balance = {
+                status: 'error',
+                message: `Balance check failed: ${error instanceof Error ? error.message : String(error)}`,
+            };
+        }
     }
 
     // Check Polymarket API
@@ -120,11 +127,11 @@ export const performHealthCheck = async (): Promise<HealthCheckResult> => {
         };
     }
 
-    // Determine overall health
+    // Determine overall health (balance check optional in track-only mode)
     const healthy =
         checks.database.status === 'ok' &&
         checks.rpc.status === 'ok' &&
-        checks.balance.status !== 'error' &&
+        (ENV.TRACK_ONLY_MODE || checks.balance.status !== 'error') &&
         checks.polymarketApi.status === 'ok';
 
     return {

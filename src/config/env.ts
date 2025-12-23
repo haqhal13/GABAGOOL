@@ -13,16 +13,21 @@ const isValidEthereumAddress = (address: string): boolean => {
  * Validate required environment variables
  */
 const validateRequiredEnv = (): void => {
+    const TRACK_ONLY_MODE = process.env.TRACK_ONLY_MODE === 'true';
+    
+    // In track-only mode, PROXY_WALLET, PRIVATE_KEY, and MONGO_URI are optional
     const required = [
         'USER_ADDRESSES',
-        'PROXY_WALLET',
-        'PRIVATE_KEY',
         'CLOB_HTTP_URL',
         'CLOB_WS_URL',
-        'MONGO_URI',
         'RPC_URL',
         'USDC_CONTRACT_ADDRESS',
     ];
+
+    // Only require wallet credentials if not in track-only mode
+    if (!TRACK_ONLY_MODE) {
+        required.push('PROXY_WALLET', 'PRIVATE_KEY', 'MONGO_URI');
+    }
 
     const missing: string[] = [];
     for (const key of required) {
@@ -80,10 +85,10 @@ const validateAddresses = (): void => {
  * Validate numeric configuration values
  */
 const validateNumericConfig = (): void => {
-    const fetchInterval = parseInt(process.env.FETCH_INTERVAL || '1', 10);
+    const fetchInterval = parseFloat(process.env.FETCH_INTERVAL || '1');
     if (isNaN(fetchInterval) || fetchInterval <= 0) {
         throw new Error(
-            `Invalid FETCH_INTERVAL: ${process.env.FETCH_INTERVAL}. Must be a positive integer.`
+            `Invalid FETCH_INTERVAL: ${process.env.FETCH_INTERVAL}. Must be a positive number (seconds).`
         );
     }
 
@@ -112,6 +117,18 @@ const validateNumericConfig = (): void => {
     if (isNaN(networkRetryLimit) || networkRetryLimit < 1 || networkRetryLimit > 10) {
         throw new Error(
             `Invalid NETWORK_RETRY_LIMIT: ${process.env.NETWORK_RETRY_LIMIT}. Must be between 1 and 10.`
+        );
+    }
+
+    const displayMaxAgeMinutes = process.env.DISPLAY_MAX_AGE_MINUTES
+        ? parseFloat(process.env.DISPLAY_MAX_AGE_MINUTES)
+        : undefined;
+    if (
+        displayMaxAgeMinutes !== undefined &&
+        (isNaN(displayMaxAgeMinutes) || displayMaxAgeMinutes <= 0)
+    ) {
+        throw new Error(
+            `Invalid DISPLAY_MAX_AGE_MINUTES: ${process.env.DISPLAY_MAX_AGE_MINUTES}. Must be a positive number (minutes).`
         );
     }
 };
@@ -328,7 +345,7 @@ export const ENV = {
     PRIVATE_KEY: process.env.PRIVATE_KEY as string,
     CLOB_HTTP_URL: process.env.CLOB_HTTP_URL as string,
     CLOB_WS_URL: process.env.CLOB_WS_URL as string,
-    FETCH_INTERVAL: parseInt(process.env.FETCH_INTERVAL || '1', 10),
+    FETCH_INTERVAL: parseFloat(process.env.FETCH_INTERVAL || '1'),
     TOO_OLD_TIMESTAMP: parseInt(process.env.TOO_OLD_TIMESTAMP || '24', 10),
     RETRY_LIMIT: parseInt(process.env.RETRY_LIMIT || '3', 10),
     // Legacy parameters (kept for backward compatibility)
@@ -345,6 +362,12 @@ export const ENV = {
         process.env.TRADE_AGGREGATION_WINDOW_SECONDS || '300',
         10
     ), // 5 minutes default
+    // Track-only mode (monitoring without executing trades)
+    TRACK_ONLY_MODE: process.env.TRACK_ONLY_MODE === 'true',
+    // Dashboard display max age (minutes) for showing markets; fallback to TOO_OLD_TIMESTAMP hours
+    DISPLAY_MAX_AGE_MINUTES: process.env.DISPLAY_MAX_AGE_MINUTES
+        ? parseFloat(process.env.DISPLAY_MAX_AGE_MINUTES)
+        : undefined,
     MONGO_URI: process.env.MONGO_URI as string,
     RPC_URL: process.env.RPC_URL as string,
     USDC_CONTRACT_ADDRESS: process.env.USDC_CONTRACT_ADDRESS as string,

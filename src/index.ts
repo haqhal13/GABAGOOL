@@ -76,7 +76,7 @@ export const main = async () => {
         console.log(`   Run health check: ${colors.cyan}npm run health-check${colors.reset}\n`);
         
         await connectDB();
-        Logger.startup(USER_ADDRESSES, PROXY_WALLET);
+        Logger.startup(USER_ADDRESSES, ENV.TRACK_ONLY_MODE ? '' : PROXY_WALLET);
 
         // Perform initial health check
         Logger.info('Performing initial health check...');
@@ -87,16 +87,22 @@ export const main = async () => {
             Logger.warning('Health check failed, but continuing startup...');
         }
 
-        Logger.info('Initializing CLOB client...');
-        const clobClient = await createClobClient();
-        Logger.success('CLOB client ready');
-
         Logger.separator();
         Logger.info('Starting trade monitor...');
         tradeMonitor();
 
-        Logger.info('Starting trade executor...');
-        tradeExecutor(clobClient);
+        // Only start trade executor if not in track-only mode
+        if (ENV.TRACK_ONLY_MODE) {
+            Logger.info('📊 TRACK-ONLY MODE: Monitoring trades only, no execution');
+            Logger.info('Trade executor disabled - bot will only track and log trades');
+        } else {
+            Logger.info('Initializing CLOB client...');
+            const clobClient = await createClobClient();
+            Logger.success('CLOB client ready');
+
+            Logger.info('Starting trade executor...');
+            tradeExecutor(clobClient);
+        }
 
         // test(clobClient);
     } catch (error) {

@@ -157,8 +157,12 @@ class Logger {
         traders.forEach((address, index) => {
             console.log(chalk.gray(`   ${index + 1}. ${address}`));
         });
-        console.log(chalk.cyan(`\n💼 Your Wallet:`));
-        console.log(chalk.gray(`   ${this.maskAddress(myWallet)}\n`));
+        if (myWallet) {
+            console.log(chalk.cyan(`\n💼 Your Wallet:`));
+            console.log(chalk.gray(`   ${this.maskAddress(myWallet)}\n`));
+        } else {
+            console.log(chalk.cyan(`\n📊 Mode: Track-Only (No Trading)\n`));
+        }
     }
 
     static dbConnection(traders: string[], counts: number[]) {

@@ -4,6 +4,7 @@ import { getUserActivityModel, getUserPositionModel } from '../models/userHistor
 import fetchData from '../utils/fetchData';
 import Logger from '../utils/logger';
 import marketTracker from './marketTracker';
+import tradeLogger from './tradeLogger';
 
 const USER_ADDRESSES = ENV.USER_ADDRESSES;
 const TOO_OLD_TIMESTAMP = ENV.TOO_OLD_TIMESTAMP;
@@ -129,14 +130,19 @@ const init = async () => {
 const processedTrades = new Set<string>();
 
 const fetchTradeData = async () => {
-    const cutoffSeconds = Math.floor(Date.now() / 1000) - TOO_OLD_TIMESTAMP * 60 * 60;
+    // Use a more lenient cutoff for watch mode - allow trades from last 48 hours
+    // This ensures we catch new markets even if there's a slight delay
+    const watchModeCutoffHours = ENV.TRACK_ONLY_MODE ? 48 : TOO_OLD_TIMESTAMP;
+    const cutoffSeconds = Math.floor(Date.now() / 1000) - watchModeCutoffHours * 60 * 60;
+    // Also allow any trade from the last 5 minutes regardless of cutoff (catches new hourly markets)
+    const recentCutoffSeconds = Math.floor(Date.now() / 1000) - (5 * 60);
 
     const isMongoConnected = mongoose.connection.readyState === 1;
     
     for (const { address, UserActivity, UserPosition } of userModels) {
         try {
             // Fetch trade activities from Polymarket API
-            const apiUrl = `https://data-api.polymarket.com/activity?user=${address}&type=TRADE`;
+            const apiUrl = `https://data-api.polymarket.com/activity?user=${address}&type=TRADE&limit=200`;
             const activities = await fetchData(apiUrl);
 
             if (!Array.isArray(activities) || activities.length === 0) {
@@ -145,8 +151,23 @@ const fetchTradeData = async () => {
 
             // Process each activity
             for (const activity of activities) {
-                // Skip if too old (older than TOO_OLD_TIMESTAMP hours)
-                if (activity.timestamp < cutoffSeconds) {
+                // Allow trades from last 5 minutes OR within the normal cutoff window
+                // This ensures we catch new hourly markets even if timestamp is slightly off
+                const isRecent = activity.timestamp >= recentCutoffSeconds;
+                const isWithinWindow = activity.timestamp >= cutoffSeconds;
+                
+                if (!isRecent && !isWithinWindow) {
+                    continue; // Skip if too old
+                }
+
+                // Verify this trade belongs to the watched wallet
+                // Check if activity has proxyWallet field and it matches, or if user field matches
+                if (activity.proxyWallet && activity.proxyWallet.toLowerCase() !== address.toLowerCase()) {
+                    // Trade might be from a different wallet, skip it
+                    continue;
+                }
+                if (activity.user && activity.user.toLowerCase() !== address.toLowerCase()) {
+                    // Trade user doesn't match, skip it
                     continue;
                 }
 
@@ -198,8 +219,16 @@ const fetchTradeData = async () => {
                     processedTrades.add(tradeKey);
                 }
                 
+                // Log trade with detailed information (including market prices)
+                tradeLogger.logTrade(activity, address).catch((error) => {
+                    Logger.error(`Error logging trade: ${error}`);
+                });
+                
                 // Process trade through market tracker (for both modes)
-                marketTracker.processTrade(activity);
+                // Note: processTrade is now async, but we don't await to avoid blocking
+                marketTracker.processTrade(activity).catch((error) => {
+                    Logger.error(`Error processing trade in market tracker: ${error}`);
+                });
             }
 
             // Also fetch and update positions (only if MongoDB is connected)
@@ -301,7 +330,9 @@ const tradeMonitor = async () => {
         await marketTracker.displayStats();
         
         if (!isRunning) break;
-        await new Promise((resolve) => setTimeout(resolve, FETCH_INTERVAL * 1000));
+        // Use faster polling for watch mode to catch new markets quickly
+        const pollInterval = ENV.TRACK_ONLY_MODE ? Math.min(FETCH_INTERVAL, 2) : FETCH_INTERVAL;
+        await new Promise((resolve) => setTimeout(resolve, pollInterval * 1000));
     }
 
     Logger.info('Trade monitor stopped');

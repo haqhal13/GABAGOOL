@@ -4,7 +4,7 @@ import * as path from 'path';
 import { ENV } from '../config/env';
 import fetchData from '../utils/fetchData';
 
-interface MarketStats {
+export interface MarketStats {
     marketKey: string; // e.g., "BTC-15min"
     marketName: string; // Full market name
     sharesUp: number;
@@ -23,6 +23,8 @@ interface MarketStats {
     currentPriceUp?: number; // Current market price for UP
     currentPriceDown?: number; // Current market price for DOWN
     lastPriceUpdate?: number; // Timestamp of last price update
+    marketOpenTime?: number; // Timestamp when this market was first opened
+    category?: string; // Market category (e.g., "BTC-UpDown-15", "ETH-UpDown-15")
 }
 
 class MarketTracker {
@@ -33,6 +35,11 @@ class MarketTracker {
     private lastMarketCount = 0;
     private loggedMarkets: Set<string> = new Set(); // Track markets already logged to CSV
     private csvFilePath: string;
+    private maxMarkets = 4; // Maximum number of markets to track at once
+    private marketsToClose: MarketStats[] = []; // Markets that need to be closed
+    private onMarketCloseCallback?: (market: MarketStats) => Promise<void>; // Callback for closing positions
+    private processedTrades: Set<string> = new Set(); // Track processed trades to prevent double-counting
+    private displayMode: 'WATCH' | 'TRADING' | 'PAPER' = 'TRADING'; // Display mode for header
 
     constructor() {
         // Initialize CSV file path in logs directory
@@ -211,6 +218,42 @@ class MarketTracker {
     }
 
     /**
+     * Check if market is 15min or hourly (1h) market
+     * Returns true if market matches 15min or hourly pattern
+     */
+    private is15MinOrHourlyMarket(activity: any): boolean {
+        const rawTitle =
+            activity?.slug ||
+            activity?.eventSlug ||
+            activity?.title ||
+            activity?.asset ||
+            '';
+        
+        if (!rawTitle) return false;
+        
+        const titleLower = rawTitle.toLowerCase();
+        
+        // Check for 15-minute timeframe
+        const has15Min = /\b15\s*min|\b15min|updown.*?15|15.*?updown/i.test(rawTitle);
+        
+        // Check for hourly timeframe (1h, 1 hour, hourly)
+        const hasHourly = /\b1\s*h|\b1\s*hour|\bhourly/i.test(rawTitle);
+        
+        // Check for hourly markets by pattern: "Up or Down" with single time (e.g., "6AM ET") but NO time range
+        // Hourly markets: "Bitcoin Up or Down - December 24, 6AM ET" (single time, no range)
+        // 15min markets: "Bitcoin Up or Down - December 24, 6:00AM-6:15AM ET" (has time range with colon)
+        const hasUpDown = /(?:up|down).*?(?:up|down)|updown/i.test(titleLower);
+        const hasCrypto = /(?:bitcoin|ethereum|btc|eth)/i.test(rawTitle);
+        const hasSingleTime = /\d{1,2}\s*(?:am|pm)\s*et/i.test(rawTitle); // Pattern like "6AM ET" or "7PM ET"
+        const hasTimeRange = /\d{1,2}:\d{2}\s*(?:am|pm)\s*[-–]\s*\d{1,2}:\d{2}\s*(?:am|pm)/i.test(rawTitle); // Pattern like "6:00AM-6:15AM"
+        
+        // If it's an Up/Down crypto market with single time but NO time range, it's hourly
+        const isHourlyPattern = hasUpDown && hasCrypto && hasSingleTime && !hasTimeRange;
+        
+        return has15Min || hasHourly || isHourlyPattern;
+    }
+
+    /**
      * Check if market is ETH-UpDown-15 or BTC-UpDown-15 type
      * Returns normalized key like "ETH-UpDown-15" or "BTC-UpDown-15" if it matches, null otherwise
      */
@@ -229,25 +272,90 @@ class MarketTracker {
         // Check for 15-minute timeframe first
         const has15Min = /\b15\s*min|\b15min|updown.*?15|15.*?updown/i.test(rawTitle);
         
-        if (!has15Min) {
+        // Check for hourly timeframe
+        const hasHourly = /\b1\s*h|\b1\s*hour|\bhourly/i.test(rawTitle);
+        
+        if (!has15Min && !hasHourly) {
             return null;
         }
         
         // Check for UpDown pattern (up/down/updown)
         const hasUpDown = /up.*?down|down.*?up|updown/i.test(rawTitle);
         
-        if (hasUpDown || has15Min) {
+        if (hasUpDown || has15Min || hasHourly) {
             // Check for Bitcoin
             if (titleLower.includes('bitcoin') || titleLower.includes('btc') || /^btc/i.test(rawTitle)) {
-                return 'BTC-UpDown-15';
+                return has15Min ? 'BTC-UpDown-15' : 'BTC-UpDown-1h';
             }
             // Check for Ethereum
             if (titleLower.includes('ethereum') || titleLower.includes('eth') || /^eth/i.test(rawTitle)) {
-                return 'ETH-UpDown-15';
+                return has15Min ? 'ETH-UpDown-15' : 'ETH-UpDown-1h';
             }
         }
         
         return null;
+    }
+
+    /**
+     * Extract market category for grouping similar markets
+     * Returns category string like "BTC-UpDown-15" or "ETH-UpDown-1h"
+     */
+    private extractMarketCategory(activity: any): string | null {
+        const upDownType = this.getUpDown15MarketType(activity);
+        if (upDownType) {
+            return upDownType;
+        }
+        
+        // Try to extract category from market name
+        const rawTitle =
+            activity?.slug ||
+            activity?.eventSlug ||
+            activity?.title ||
+            activity?.asset ||
+            '';
+        
+        if (!rawTitle) return null;
+        
+        const titleLower = rawTitle.toLowerCase();
+        
+        // Check for Bitcoin
+        if (titleLower.includes('bitcoin') || titleLower.includes('btc') || /^btc/i.test(rawTitle)) {
+            const has15Min = /\b15\s*min|\b15min/i.test(rawTitle);
+            const hasHourly = /\b1\s*h|\b1\s*hour|\bhourly/i.test(rawTitle);
+            // Also check for hourly pattern: single time without range
+            const hasUpDown = /(?:up|down).*?(?:up|down)|updown/i.test(titleLower);
+            const hasSingleTime = /\d{1,2}\s*(?:am|pm)\s*et/i.test(rawTitle);
+            const hasTimeRange = /\d{1,2}:\d{2}\s*(?:am|pm)\s*[-–]\s*\d{1,2}:\d{2}\s*(?:am|pm)/i.test(rawTitle);
+            const isHourlyPattern = hasUpDown && hasSingleTime && !hasTimeRange;
+            
+            if (has15Min) return 'BTC-UpDown-15';
+            if (hasHourly || isHourlyPattern) return 'BTC-UpDown-1h';
+            return 'BTC';
+        }
+        
+        // Check for Ethereum
+        if (titleLower.includes('ethereum') || titleLower.includes('eth') || /^eth/i.test(rawTitle)) {
+            const has15Min = /\b15\s*min|\b15min/i.test(rawTitle);
+            const hasHourly = /\b1\s*h|\b1\s*hour|\bhourly/i.test(rawTitle);
+            // Also check for hourly pattern: single time without range
+            const hasUpDown = /(?:up|down).*?(?:up|down)|updown/i.test(titleLower);
+            const hasSingleTime = /\d{1,2}\s*(?:am|pm)\s*et/i.test(rawTitle);
+            const hasTimeRange = /\d{1,2}:\d{2}\s*(?:am|pm)\s*[-–]\s*\d{1,2}:\d{2}\s*(?:am|pm)/i.test(rawTitle);
+            const isHourlyPattern = hasUpDown && hasSingleTime && !hasTimeRange;
+            
+            if (has15Min) return 'ETH-UpDown-15';
+            if (hasHourly || isHourlyPattern) return 'ETH-UpDown-1h';
+            return 'ETH';
+        }
+        
+        return null;
+    }
+
+    /**
+     * Set callback for closing positions when markets are switched
+     */
+    setMarketCloseCallback(callback: (market: MarketStats) => Promise<void>): void {
+        this.onMarketCloseCallback = callback;
     }
 
     /**
@@ -621,14 +729,221 @@ class MarketTracker {
     }
 
     /**
+     * Close old markets in the same category when a new one opens
+     */
+    private async closeOldMarketsInCategory(newMarket: MarketStats, newCategory: string | null): Promise<void> {
+        if (!newCategory) return;
+
+        const marketsToClose: MarketStats[] = [];
+        
+        for (const [key, market] of this.markets.entries()) {
+            if (key === newMarket.marketKey) continue;
+            
+            // Check if this market is in the same category
+            if (market.category === newCategory) {
+                // This is an older market in the same category - mark it for closing
+                marketsToClose.push(market);
+            }
+        }
+
+        // Close old markets and record profits
+        for (const oldMarket of marketsToClose) {
+            // Record profit from point of new market opening
+            await this.recordProfitAtMarketSwitch(oldMarket, newMarket);
+            
+            // Remove from tracking
+            this.markets.delete(oldMarket.marketKey);
+            
+            // Trigger position closing callback if set
+            if (this.onMarketCloseCallback) {
+                try {
+                    await this.onMarketCloseCallback(oldMarket);
+                } catch (error) {
+                    console.error(`Error closing positions for market ${oldMarket.marketKey}:`, error);
+                }
+            }
+        }
+    }
+
+    /**
+     * Record profit from point of new market opening
+     * This records PnL for a market at the time a new market opens
+     */
+    private async recordProfitAtNewMarketOpening(market: MarketStats, newMarket: MarketStats, isSwitching: boolean = false): Promise<void> {
+        // Fetch current prices at the time of new market opening
+        const finalPrices = await this.fetchFinalPrices(market);
+        
+        const totalInvested = market.investedUp + market.investedDown;
+        
+        // Skip if no investment
+        if (totalInvested === 0) {
+            return;
+        }
+        
+        let finalValueUp = 0;
+        let finalValueDown = 0;
+        let pnlUp = 0;
+        let pnlDown = 0;
+
+        const finalPriceUp = finalPrices.priceUp ?? market.currentPriceUp ?? 0;
+        const finalPriceDown = finalPrices.priceDown ?? market.currentPriceDown ?? 0;
+
+        if (market.sharesUp > 0 && finalPriceUp > 0) {
+            finalValueUp = market.sharesUp * finalPriceUp;
+            pnlUp = finalValueUp - market.investedUp;
+        }
+
+        if (market.sharesDown > 0 && finalPriceDown > 0) {
+            finalValueDown = market.sharesDown * finalPriceDown;
+            pnlDown = finalValueDown - market.investedDown;
+        }
+
+        const totalFinalValue = finalValueUp + finalValueDown;
+        const totalPnl = pnlUp + pnlDown;
+        const pnlPercent = totalInvested > 0 ? (totalPnl / totalInvested) * 100 : 0;
+
+        // Determine outcome
+        let outcome = 'Unknown';
+        if (finalPriceUp >= 0.99) {
+            outcome = 'UP Won';
+        } else if (finalPriceUp <= 0.01) {
+            outcome = 'UP Lost';
+        } else if (finalPriceDown >= 0.99) {
+            outcome = 'DOWN Won';
+        } else if (finalPriceDown <= 0.01) {
+            outcome = 'DOWN Lost';
+        } else if (totalPnl > 0) {
+            outcome = 'Profit';
+        } else if (totalPnl < 0) {
+            outcome = 'Loss';
+        }
+
+        // Log to CSV
+        const timestamp = Date.now();
+        const date = new Date().toISOString();
+        const marketKeyDisplay = isSwitching 
+            ? `${market.marketKey}->${newMarket.marketKey}`
+            : market.marketKey;
+        const marketNameDisplay = isSwitching
+            ? `"${market.marketName.replace(/"/g, '""')} (New market: ${newMarket.marketName.replace(/"/g, '""')})"`
+            : `"${market.marketName.replace(/"/g, '""')} (Snapshot at new market: ${newMarket.marketName.replace(/"/g, '""')})"`;
+        
+        const row = [
+            timestamp,
+            date,
+            marketKeyDisplay,
+            marketNameDisplay,
+            market.conditionId || '',
+            market.investedUp.toFixed(2),
+            market.investedDown.toFixed(2),
+            totalInvested.toFixed(2),
+            market.sharesUp.toFixed(4),
+            market.sharesDown.toFixed(4),
+            finalPriceUp.toFixed(4),
+            finalPriceDown.toFixed(4),
+            finalValueUp.toFixed(2),
+            finalValueDown.toFixed(2),
+            totalFinalValue.toFixed(2),
+            pnlUp.toFixed(2),
+            pnlDown.toFixed(2),
+            totalPnl.toFixed(2),
+            pnlPercent.toFixed(2),
+            market.tradesUp,
+            market.tradesDown,
+            isSwitching ? 'Market Switch' : 'New Market Snapshot'
+        ].join(',');
+
+        try {
+            fs.appendFileSync(this.csvFilePath, row + '\n', 'utf8');
+        } catch (error) {
+            console.error(`Failed to write market PnL to CSV: ${error}`);
+        }
+    }
+
+    /**
+     * Record profit from point of new market opening (legacy method name for backward compatibility)
+     */
+    private async recordProfitAtMarketSwitch(oldMarket: MarketStats, newMarket: MarketStats): Promise<void> {
+        await this.recordProfitAtNewMarketOpening(oldMarket, newMarket, true);
+    }
+
+    /**
+     * Record PnL for all active markets when a new market opens
+     */
+    private async recordAllMarketsPnLAtNewMarketOpening(newMarket: MarketStats): Promise<void> {
+        // Record PnL for all existing markets (except the new one)
+        const marketsToRecord = Array.from(this.markets.values()).filter(
+            m => m.marketKey !== newMarket.marketKey
+        );
+
+        // Record PnL for each market
+        for (const market of marketsToRecord) {
+            // Only record if there's actual investment
+            if (market.investedUp > 0 || market.investedDown > 0) {
+                await this.recordProfitAtNewMarketOpening(market, newMarket, false);
+            }
+        }
+    }
+
+    /**
+     * Limit markets to maximum count, removing oldest ones
+     */
+    private async enforceMaxMarkets(): Promise<void> {
+        if (this.markets.size <= this.maxMarkets) {
+            return;
+        }
+
+        // Sort markets by lastUpdate (oldest first)
+        const sortedMarkets = Array.from(this.markets.entries())
+            .sort((a, b) => a[1].lastUpdate - b[1].lastUpdate);
+
+        // Remove oldest markets until we're at max
+        const toRemove = sortedMarkets.slice(0, this.markets.size - this.maxMarkets);
+        
+        for (const [key, market] of toRemove) {
+            // Record profit before removing
+            await this.logClosedMarketPnL(market);
+            
+            // Remove from tracking
+            this.markets.delete(key);
+            
+            // Trigger position closing callback if set
+            if (this.onMarketCloseCallback) {
+                try {
+                    await this.onMarketCloseCallback(market);
+                } catch (error) {
+                    console.error(`Error closing positions for market ${key}:`, error);
+                }
+            }
+        }
+    }
+
+    /**
      * Process a new trade
      */
-    processTrade(activity: any): void {
+    async processTrade(activity: any): Promise<void> {
+        // Only process 15min or hourly markets
+        if (!this.is15MinOrHourlyMarket(activity)) {
+            return; // Skip non-15min/hourly markets
+        }
+
+        // Create unique trade identifier to prevent double-counting
+        // Use transactionHash + asset + side as unique key
+        const tradeId = activity.transactionHash 
+            ? `${activity.transactionHash}:${activity.asset}:${activity.side || 'BUY'}`
+            : `${activity.timestamp}:${activity.asset}:${activity.side || 'BUY'}`;
+        
+        // Skip if we've already processed this exact trade
+        if (this.processedTrades.has(tradeId)) {
+            return; // Already processed this trade, skip to prevent double-counting
+        }
+
         const marketKey = this.extractMarketKey(activity);
         const isUp = this.isUpOutcome(activity);
         const shares = parseFloat(activity.size || '0');
         const invested = parseFloat(activity.usdcSize || '0');
         const side = activity.side?.toUpperCase() || 'BUY';
+        const category = this.extractMarketCategory(activity);
 
         const isNewMarket = !this.markets.has(marketKey);
         
@@ -655,11 +970,25 @@ class MarketTracker {
                 conditionId: activity.conditionId,
                 assetUp: isUp ? activity.asset : undefined,
                 assetDown: !isUp ? activity.asset : undefined,
+                marketOpenTime: Date.now(),
+                category: category || undefined,
             };
             this.markets.set(marketKey, market);
             
             // Remove previous time window markets when a new one starts
             this.removePreviousTimeWindow(market);
+            
+            // Record PnL for ALL existing markets at the time of new market opening
+            // This captures the PnL snapshot of all markets when a new one opens
+            await this.recordAllMarketsPnLAtNewMarketOpening(market);
+            
+            // Close old markets in the same category
+            if (category) {
+                await this.closeOldMarketsInCategory(market, category);
+            }
+            
+            // Enforce max markets limit
+            await this.enforceMaxMarkets();
             
             // Force immediate display update for new markets
             if (isNewMarket) {
@@ -685,6 +1014,10 @@ class MarketTracker {
             if (!isUp && activity.asset && !market.assetDown) {
                 market.assetDown = activity.asset;
             }
+            // Update category if not set
+            if (!market.category && category) {
+                market.category = category;
+            }
         }
 
         const price = parseFloat(activity.price || '0');
@@ -703,6 +1036,12 @@ class MarketTracker {
                 market.totalCostDown += cost;
                 market.tradesDown += 1;
             }
+            
+            // Mark this trade as processed to prevent double-counting
+            this.processedTrades.add(tradeId);
+        } else {
+            // For SELL trades, also mark as processed but don't count
+            this.processedTrades.add(tradeId);
         }
 
         market.lastUpdate = Date.now();
@@ -778,7 +1117,8 @@ class MarketTracker {
         if (this.markets.size === 0) {
             // Show empty state if we had markets before but now have none
             if (previousMarketCount > 0) {
-                console.clear();
+                // Use ANSI escape codes for reliable screen clearing
+                process.stdout.write('\x1b[2J\x1b[0f');
                 console.log(chalk.cyan('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
                 console.log(chalk.cyan.bold('  📊 MARKET TRACKING SUMMARY'));
                 console.log(chalk.cyan('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
@@ -847,7 +1187,8 @@ class MarketTracker {
         if (activeMarkets.length === 0) {
             // Only show empty state if we had markets before
             if (marketsBeforeFilter > 0) {
-                console.clear();
+                // Use ANSI escape codes for reliable screen clearing
+                process.stdout.write('\x1b[2J\x1b[0f');
                 console.log(chalk.cyan('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
                 console.log(chalk.cyan.bold('  📊 MARKET TRACKING SUMMARY'));
                 console.log(chalk.cyan('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
@@ -862,11 +1203,35 @@ class MarketTracker {
         const pricePromises = activeMarkets.map(m => this.fetchCurrentPrices(m));
         await Promise.allSettled(pricePromises);
 
-        // Stable dashboard: clear screen and redraw
-        console.clear();
+        // Stable dashboard: clear screen and redraw using ANSI escape codes for reliability
+        process.stdout.write('\x1b[2J\x1b[0f');
 
+        // Show mode header based on display mode or ENV setting
+        const isWatchMode = ENV.TRACK_ONLY_MODE;
+        let modeHeader: string;
+        if (this.displayMode === 'PAPER') {
+            modeHeader = '📊 PAPER MODE';
+        } else if (this.displayMode === 'WATCH' || isWatchMode) {
+            modeHeader = '👀 WATCH MODE';
+        } else {
+            modeHeader = '📊 TRADING MODE';
+        }
+        
         console.log(chalk.cyan('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
-        console.log(chalk.cyan.bold('  📊 MARKET TRACKING SUMMARY'));
+        console.log(chalk.cyan.bold(`  ${modeHeader} - TRADER MARKET TRACKING`));
+        if (ENV.USER_ADDRESSES.length > 0) {
+            if (ENV.USER_ADDRESSES.length === 1) {
+                const addr = ENV.USER_ADDRESSES[0];
+                console.log(chalk.gray(`  Watching: ${chalk.white(addr)}`));
+                console.log(chalk.gray(`  Active Markets: ${activeMarkets.length}/${this.maxMarkets} | All trades verified from target wallet`));
+            } else {
+                console.log(chalk.gray(`  Watching: ${ENV.USER_ADDRESSES.length} traders`));
+                ENV.USER_ADDRESSES.forEach((addr, idx) => {
+                    console.log(chalk.gray(`    ${idx + 1}. ${addr}`));
+                });
+                console.log(chalk.gray(`  Active Markets: ${activeMarkets.length}/${this.maxMarkets}`));
+            }
+        }
         console.log(chalk.cyan('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
         console.log(''); // Empty line
 
@@ -877,6 +1242,12 @@ class MarketTracker {
                 const totalB = b.investedUp + b.investedDown;
                 return totalB - totalA;
             });
+
+        // Calculate totals across all markets
+        let totalInvestedAll = 0;
+        let totalValueAll = 0;
+        let totalPnlAll = 0;
+        let totalTradesAll = 0;
 
         for (const market of sortedMarkets) {
             const totalInvested = market.investedUp + market.investedDown;
@@ -905,6 +1276,12 @@ class MarketTracker {
             }
 
             totalPnl = pnlUp + pnlDown;
+            
+            // Accumulate totals
+            totalInvestedAll += totalInvested;
+            totalValueAll += (currentValueUp + currentValueDown);
+            totalPnlAll += totalPnl;
+            totalTradesAll += (market.tradesUp + market.tradesDown);
             
             // Compact display format
             const marketNameDisplay = market.marketName.length > 50 
@@ -959,8 +1336,26 @@ class MarketTracker {
             console.log(''); // Empty line between markets
         }
 
+        // Display summary across all markets
+        console.log(chalk.cyan('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
+        console.log(chalk.yellow.bold('  📊 PORTFOLIO SUMMARY (All Markets)'));
+        const totalPnlColor = totalPnlAll >= 0 ? chalk.green : chalk.red;
+        const totalPnlSign = totalPnlAll >= 0 ? '+' : '';
+        const totalPnlPercent = totalInvestedAll > 0 ? ((totalPnlAll / totalInvestedAll) * 100).toFixed(2) : '0.00';
+        
+        console.log(chalk.cyan(`  Total Invested: ${chalk.white(`$${totalInvestedAll.toFixed(2)}`)}`));
+        console.log(chalk.cyan(`  Current Value:  ${chalk.white(`$${totalValueAll.toFixed(2)}`)}`));
+        console.log(chalk.cyan(`  Total PnL:      ${totalPnlColor(`${totalPnlSign}$${totalPnlAll.toFixed(2)} (${totalPnlSign}${totalPnlPercent}%)`)}`));
+        console.log(chalk.cyan(`  Total Trades:   ${chalk.white(totalTradesAll.toString())}`));
         console.log(chalk.cyan('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
         console.log(''); // Empty line at end
+    }
+
+    /**
+     * Set display mode for header (WATCH, TRADING, or PAPER)
+     */
+    setDisplayMode(mode: 'WATCH' | 'TRADING' | 'PAPER'): void {
+        this.displayMode = mode;
     }
 
     /**

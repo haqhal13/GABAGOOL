@@ -38,6 +38,8 @@
         "health-check": "ts-node src/scripts/healthCheck.ts",
         "run": "npm run dev",
         "start-bot": "npm run dev",
+        "paper-trade": "ts-node src/paper-trading/paperTradingBot.ts",
+        "paper": "npm run paper-trade",
         "lint": "eslint .",
         "lint:fix": "eslint --fix .",
         "format": "prettier --write .",

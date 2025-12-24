@@ -3,6 +3,8 @@ import { ENV } from './config/env';
 import createClobClient from './utils/createClobClient';
 import tradeExecutor, { stopTradeExecutor } from './services/tradeExecutor';
 import tradeMonitor, { stopTradeMonitor } from './services/tradeMonitor';
+import marketTracker from './services/marketTracker';
+import { closeMarketPositions } from './services/positionCloser';
 import Logger from './utils/logger';
 import { performHealthCheck, logHealthCheck } from './utils/healthCheck';
 import test from './test/test';
@@ -88,20 +90,38 @@ export const main = async () => {
         }
 
         Logger.separator();
+        
+        // Set up market close callback for position closing
+        let clobClientForClosing: Awaited<ReturnType<typeof createClobClient>> | null = null;
+        
+        if (!ENV.TRACK_ONLY_MODE) {
+            Logger.info('Initializing CLOB client...');
+            clobClientForClosing = await createClobClient();
+            Logger.success('CLOB client ready');
+        }
+        
+        // Set up callback for closing positions when markets are switched
+        marketTracker.setMarketCloseCallback(async (market) => {
+            await closeMarketPositions(clobClientForClosing, market);
+        });
+        
         Logger.info('Starting trade monitor...');
         tradeMonitor();
 
         // Only start trade executor if not in track-only mode
         if (ENV.TRACK_ONLY_MODE) {
-            Logger.info('📊 TRACK-ONLY MODE: Monitoring trades only, no execution');
-            Logger.info('Trade executor disabled - bot will only track and log trades');
+            Logger.separator();
+            Logger.info('👀 WATCH MODE ACTIVATED');
+            Logger.info('📊 Dashboard will display trader activity on up to 4 markets');
+            Logger.info('📈 Shows real-time PnL, positions, and market statistics');
+            Logger.info('💾 All trades logged to logs/trades_log.csv');
+            Logger.info('💾 Market PnL logged to logs/market_pnl.csv');
+            Logger.info('');
+            Logger.info('Trade executor disabled - monitoring only, no execution');
+            Logger.separator();
         } else {
-            Logger.info('Initializing CLOB client...');
-            const clobClient = await createClobClient();
-            Logger.success('CLOB client ready');
-
             Logger.info('Starting trade executor...');
-            tradeExecutor(clobClient);
+            tradeExecutor(clobClientForClosing!);
         }
 
         // test(clobClient);

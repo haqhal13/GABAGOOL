@@ -60,8 +60,8 @@ export interface MarketStats {
 class MarketTracker {
     private markets: Map<string, MarketStats> = new Map();
     private lastDisplayTime = 0;
-    // Stable dashboard: update every 1s unless new market forces immediate refresh
-    private displayInterval = 1000;
+    // Stable dashboard: update every 500ms for responsive price updates
+    private displayInterval = 500;
     private lastMarketCount = 0;
     private loggedMarkets: Set<string> = new Set(); // Track markets already logged to CSV
     private csvFilePath: string;
@@ -344,31 +344,36 @@ class MarketTracker {
             activity?.title ||
             activity?.asset ||
             '';
-        
+
         if (!rawTitle) return null;
-        
+
         const titleLower = rawTitle.toLowerCase();
-        
-        // Check for 15-minute timeframe first
-        const has15Min = /\b15\s*min|\b15min|updown.*?15|15.*?updown/i.test(rawTitle);
-        
+
+        // Check for 15-minute timeframe:
+        // 1. Explicit "15 min" or "15min" patterns
+        // 2. Slug pattern like "updown-15m-"
+        // 3. Time range pattern like "5:00PM-5:15PM" (15-minute window)
+        const hasExplicit15Min = /\b15\s*min|\b15min|updown.*?15m|15m.*?updown/i.test(rawTitle);
+        // Time range like "X:00PM-X:15PM" or "X:15PM-X:30PM" etc (15-min windows)
+        const hasTimeRange = /\d{1,2}:\d{2}\s*(?:am|pm)?\s*[-–]\s*\d{1,2}:\d{2}\s*(?:am|pm)?/i.test(rawTitle);
+        const has15Min = hasExplicit15Min || hasTimeRange;
+
         // Check for hourly timeframe (explicit)
         const hasHourly = /\b1\s*h|\b1\s*hour|\bhourly/i.test(rawTitle);
-        
+
         // Check for hourly markets by pattern: "Up or Down" with single time (e.g., "6AM ET") but NO time range
         // Also handle slug format: "bitcoin-up-or-down-december-24-9am-et" (with hyphens)
         const hasUpDown = /(?:up|down).*?(?:up|down)|updown/i.test(titleLower);
         const hasCrypto = /(?:bitcoin|ethereum|btc|eth)/i.test(rawTitle);
         // Pattern like "6AM ET" or "7PM ET" (with spaces) OR "9am-et" (with hyphens in slug)
         const hasSingleTime = /\d{1,2}\s*(?:am|pm)\s*et/i.test(rawTitle) || /\d{1,2}(?:am|pm)-et/i.test(rawTitle);
-        const hasTimeRange = /\d{1,2}:\d{2}\s*(?:am|pm)\s*[-–]\s*\d{1,2}:\d{2}\s*(?:am|pm)/i.test(rawTitle); // Pattern like "6:00AM-6:15AM"
         const isHourlyPattern = hasUpDown && hasCrypto && hasSingleTime && !hasTimeRange;
-        
+
         // If it's not 15min, not explicitly hourly, and not hourly by pattern, skip
         if (!has15Min && !hasHourly && !isHourlyPattern) {
             return null;
         }
-        
+
         // Check for UpDown pattern (up/down/updown) - required for categorization
         if (hasUpDown || has15Min || hasHourly || isHourlyPattern) {
             // Check for Bitcoin
@@ -380,7 +385,7 @@ class MarketTracker {
                 return has15Min ? 'ETH-UpDown-15' : 'ETH-UpDown-1h';
             }
         }
-        
+
         return null;
     }
 
@@ -408,31 +413,31 @@ class MarketTracker {
         
         // Check for Bitcoin
         if (titleLower.includes('bitcoin') || titleLower.includes('btc') || /^btc/i.test(rawTitle)) {
-            const has15Min = /\b15\s*min|\b15min/i.test(rawTitle);
+            const hasExplicit15Min = /\b15\s*min|\b15min|updown.*?15m/i.test(rawTitle);
+            const hasTimeRange = /\d{1,2}:\d{2}\s*(?:am|pm)?\s*[-–]\s*\d{1,2}:\d{2}\s*(?:am|pm)?/i.test(rawTitle);
+            const has15Min = hasExplicit15Min || hasTimeRange;
             const hasHourly = /\b1\s*h|\b1\s*hour|\bhourly/i.test(rawTitle);
             // Also check for hourly pattern: single time without range
-            // Handle both title format (with spaces) and slug format (with hyphens)
             const hasUpDown = /(?:up|down).*?(?:up|down)|updown/i.test(titleLower);
             const hasSingleTime = /\d{1,2}\s*(?:am|pm)\s*et/i.test(rawTitle) || /\d{1,2}(?:am|pm)-et/i.test(rawTitle);
-            const hasTimeRange = /\d{1,2}:\d{2}\s*(?:am|pm)\s*[-–]\s*\d{1,2}:\d{2}\s*(?:am|pm)/i.test(rawTitle);
             const isHourlyPattern = hasUpDown && hasSingleTime && !hasTimeRange;
-            
+
             if (has15Min) return 'BTC-UpDown-15';
             if (hasHourly || isHourlyPattern) return 'BTC-UpDown-1h';
             return 'BTC';
         }
-        
+
         // Check for Ethereum
         if (titleLower.includes('ethereum') || titleLower.includes('eth') || /^eth/i.test(rawTitle)) {
-            const has15Min = /\b15\s*min|\b15min/i.test(rawTitle);
+            const hasExplicit15Min = /\b15\s*min|\b15min|updown.*?15m/i.test(rawTitle);
+            const hasTimeRange = /\d{1,2}:\d{2}\s*(?:am|pm)?\s*[-–]\s*\d{1,2}:\d{2}\s*(?:am|pm)?/i.test(rawTitle);
+            const has15Min = hasExplicit15Min || hasTimeRange;
             const hasHourly = /\b1\s*h|\b1\s*hour|\bhourly/i.test(rawTitle);
             // Also check for hourly pattern: single time without range
-            // Handle both title format (with spaces) and slug format (with hyphens)
             const hasUpDown = /(?:up|down).*?(?:up|down)|updown/i.test(titleLower);
             const hasSingleTime = /\d{1,2}\s*(?:am|pm)\s*et/i.test(rawTitle) || /\d{1,2}(?:am|pm)-et/i.test(rawTitle);
-            const hasTimeRange = /\d{1,2}:\d{2}\s*(?:am|pm)\s*[-–]\s*\d{1,2}:\d{2}\s*(?:am|pm)/i.test(rawTitle);
             const isHourlyPattern = hasUpDown && hasSingleTime && !hasTimeRange;
-            
+
             if (has15Min) return 'ETH-UpDown-15';
             if (hasHourly || isHourlyPattern) return 'ETH-UpDown-1h';
             return 'ETH';
@@ -1177,8 +1182,10 @@ class MarketTracker {
                 lastUpdate: Date.now(),
                 endDate: activity.endDate ? activity.endDate * 1000 : undefined, // Convert to milliseconds
                 conditionId: activity.conditionId,
-                assetUp: isUp ? activity.asset : undefined,
-                assetDown: !isUp ? activity.asset : undefined,
+                // Set BOTH asset IDs if provided (paper trades provide both)
+                // Otherwise infer from single asset based on outcome direction
+                assetUp: activity.assetUp || (isUp ? activity.asset : undefined),
+                assetDown: activity.assetDown || (!isUp ? activity.asset : undefined),
                 marketOpenTime: Date.now(),
                 category: category || undefined,
             };
@@ -1209,19 +1216,42 @@ class MarketTracker {
                 return;
             }
         } else {
-            // Update endDate and conditionId if available and not already set
-            if (activity.endDate && !market.endDate) {
+            // Update endDate and conditionId - ALWAYS update conditionId to handle market rotations
+            if (activity.endDate) {
                 market.endDate = activity.endDate * 1000; // Convert to milliseconds
             }
-            if (activity.conditionId && !market.conditionId) {
+            if (activity.conditionId) {
+                // Update conditionId - handles market rotations (new 15-min window)
                 market.conditionId = activity.conditionId;
-            }
-            // Store asset IDs for UP and DOWN outcomes
-            if (isUp && activity.asset && !market.assetUp) {
-                market.assetUp = activity.asset;
-            }
-            if (!isUp && activity.asset && !market.assetDown) {
-                market.assetDown = activity.asset;
+
+                // ALWAYS update assets when provided (handles market rotations)
+                if (activity.assetUp) {
+                    market.assetUp = activity.assetUp;
+                }
+                if (activity.assetDown) {
+                    market.assetDown = activity.assetDown;
+                }
+                // Fallback: infer from single asset field based on outcome
+                if (isUp && activity.asset) {
+                    market.assetUp = activity.asset;
+                }
+                if (!isUp && activity.asset) {
+                    market.assetDown = activity.asset;
+                }
+            } else {
+                // No conditionId - still update assets if provided and missing
+                if (activity.assetUp && !market.assetUp) {
+                    market.assetUp = activity.assetUp;
+                }
+                if (activity.assetDown && !market.assetDown) {
+                    market.assetDown = activity.assetDown;
+                }
+                if (isUp && activity.asset && !market.assetUp) {
+                    market.assetUp = activity.asset;
+                }
+                if (!isUp && activity.asset && !market.assetDown) {
+                    market.assetDown = activity.asset;
+                }
             }
             // Update category if not set
             if (!market.category && category) {
@@ -1898,6 +1928,76 @@ class MarketTracker {
             }
         }
         return undefined;
+    }
+
+    /**
+     * Update market asset IDs (used when we fetch assets from Gamma API)
+     * This allows price fetching to work when watcher trades only provided one asset
+     */
+    updateMarketAssets(conditionId: string, assetUp: string, assetDown: string, marketKey?: string): void {
+        // First try by conditionId
+        for (const market of this.markets.values()) {
+            if (market.conditionId === conditionId) {
+                // FORCE set assets even if already set (might have been wrong)
+                if (assetUp) market.assetUp = assetUp;
+                if (assetDown) market.assetDown = assetDown;
+                return;
+            }
+        }
+        // Fallback: try by marketKey
+        if (marketKey) {
+            const market = this.markets.get(marketKey);
+            if (market) {
+                if (assetUp) market.assetUp = assetUp;
+                if (assetDown) market.assetDown = assetDown;
+                if (conditionId) market.conditionId = conditionId;
+            }
+        }
+    }
+
+    /**
+     * Ensure a market exists with both asset IDs (for proactive discovery)
+     * Creates the market if it doesn't exist, updates assets if it does
+     */
+    ensureMarketWithAssets(
+        marketKey: string,
+        marketName: string,
+        marketSlug: string,
+        conditionId: string,
+        assetUp: string,
+        assetDown: string,
+        endDate?: number
+    ): void {
+        let market = this.markets.get(marketKey);
+        if (!market) {
+            // Create new market with assets for immediate price fetching
+            market = {
+                marketKey,
+                marketName,
+                marketSlug,
+                sharesUp: 0,
+                sharesDown: 0,
+                investedUp: 0,
+                investedDown: 0,
+                totalCostUp: 0,
+                totalCostDown: 0,
+                tradesUp: 0,
+                tradesDown: 0,
+                lastUpdate: Date.now(),
+                endDate,
+                conditionId,
+                assetUp,
+                assetDown,
+                marketOpenTime: Date.now(),
+            };
+            this.markets.set(marketKey, market);
+        } else {
+            // Update existing market with assets (force update to ensure we have them)
+            if (assetUp) market.assetUp = assetUp;
+            if (assetDown) market.assetDown = assetDown;
+            if (conditionId) market.conditionId = conditionId;
+            if (endDate && !market.endDate) market.endDate = endDate;
+        }
     }
 
     /**

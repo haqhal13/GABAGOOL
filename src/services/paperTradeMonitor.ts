@@ -15,6 +15,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import mongoose from 'mongoose';
+import chalk from 'chalk';
 import { ENV } from '../config/env';
 import { getUserActivityModel } from '../models/userHistory';
 import fetchData from '../utils/fetchData';
@@ -64,7 +65,7 @@ const MIN_SHARES = 0.5;
 // =============================================================================
 const BATCH_INTERVAL_MS = 2000;
 const BASE_GAP_MS = 2500;
-const POLL_INTERVAL_MS = 1000;
+const POLL_INTERVAL_MS = 300; // Reduced from 1000ms for faster price updates
 
 // Direction balance: 50.7% UP by $, 49.9% UP by count
 const UP_BIAS = 0.507; // Match exact watcher ratio by $
@@ -266,6 +267,61 @@ async function fetchMarketExpiration(conditionId: string): Promise<number | null
 const fetchedSlugs = new Set<string>();
 
 /**
+ * Fetch missing asset IDs from Gamma API using conditionId or slug
+ * Returns { assetUp, assetDown } or null if not found
+ */
+async function fetchMarketAssets(conditionId: string, slug?: string): Promise<{ assetUp: string; assetDown: string } | null> {
+    if (!conditionId && !slug) {
+        return null;
+    }
+
+    try {
+        // Try fetching by slug first (more reliable for new 15-min markets)
+        if (slug) {
+            const slugUrl = `https://gamma-api.polymarket.com/events?slug=${slug}`;
+            const data = await fetchData(slugUrl).catch(() => null);
+            if (data && data.length > 0) {
+                const event = data[0];
+                const markets = event.markets || [];
+                if (markets.length > 0) {
+                    const market = markets[0];
+                    const clobTokenIds = market.clobTokenIds || [];
+                    if (clobTokenIds.length >= 2) {
+                        const outcomes = market.outcomes || ['Up', 'Down'];
+                        const isFirstUp = outcomes[0]?.toLowerCase().includes('up');
+                        const assetUp = isFirstUp ? clobTokenIds[0] : clobTokenIds[1];
+                        const assetDown = isFirstUp ? clobTokenIds[1] : clobTokenIds[0];
+                        debugLog(`fetchMarketAssets: Found assets via slug ${slug}: UP=${assetUp?.slice(0,8)}..., DOWN=${assetDown?.slice(0,8)}...`);
+                        return { assetUp, assetDown };
+                    }
+                }
+            }
+        }
+
+        // Fallback: Fetch from general markets list by conditionId
+        if (conditionId) {
+            const gammaUrl = `https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=500`;
+            const marketList = await fetchData(gammaUrl).catch(() => null);
+
+            if (Array.isArray(marketList)) {
+                const marketData = marketList.find((m: any) => m.condition_id === conditionId);
+                if (marketData && marketData.clobTokenIds && marketData.clobTokenIds.length >= 2) {
+                    const outcomes = marketData.outcomes || ['Up', 'Down'];
+                    const isFirstUp = outcomes[0]?.toLowerCase().includes('up');
+                    const assetUp = isFirstUp ? marketData.clobTokenIds[0] : marketData.clobTokenIds[1];
+                    const assetDown = isFirstUp ? marketData.clobTokenIds[1] : marketData.clobTokenIds[0];
+                    debugLog(`fetchMarketAssets: Found assets for ${conditionId}: UP=${assetUp?.slice(0,8)}..., DOWN=${assetDown?.slice(0,8)}...`);
+                    return { assetUp, assetDown };
+                }
+            }
+        }
+    } catch (e) {
+        debugLog(`fetchMarketAssets failed for ${conditionId}/${slug}: ${e}`);
+    }
+    return null;
+}
+
+/**
  * PROACTIVE MARKET DISCOVERY
  * Instead of waiting for watcher to trade, directly search for the 4 market types:
  * - BTC 15-min: btc-updown-15m-{timestamp}
@@ -370,6 +426,48 @@ async function proactivelyDiscoverMarkets(): Promise<void> {
                         : event.endDate < 10000000000 ? event.endDate * 1000 : event.endDate;
                 }
 
+                // FALLBACK: Calculate endDate from slug if not provided by API
+                if (!endDate || endDate === 0) {
+                    // For 15-min markets: btc-updown-15m-{timestamp}
+                    const timestamp15Match = slug.match(/updown-15m-(\d+)/);
+                    if (timestamp15Match) {
+                        const startTime = parseInt(timestamp15Match[1], 10) * 1000;
+                        endDate = startTime + (15 * 60 * 1000); // 15 minutes from start
+                    }
+                    // For hourly markets: bitcoin-up-or-down-december-26-10am-et
+                    const hourlyMatch = slug.match(/(\w+)-(\d+)-(\d{1,2})(am|pm)-et$/i);
+                    if (hourlyMatch) {
+                        const monthName = hourlyMatch[1];
+                        const day = parseInt(hourlyMatch[2], 10);
+                        let hour = parseInt(hourlyMatch[3], 10);
+                        const ampm = hourlyMatch[4].toLowerCase();
+                        if (ampm === 'pm' && hour !== 12) hour += 12;
+                        if (ampm === 'am' && hour === 12) hour = 0;
+
+                        // Calculate end time (1 hour after start)
+                        const months: {[key: string]: number} = {
+                            january: 0, february: 1, march: 2, april: 3, may: 4, june: 5,
+                            july: 6, august: 7, september: 8, october: 9, november: 10, december: 11
+                        };
+                        const monthNum = months[monthName.toLowerCase()] ?? 0;
+                        const year = new Date().getFullYear();
+
+                        // Create a date string in ET and parse it properly
+                        // Market "10am ET" runs from 10am to 11am ET
+                        // Use Intl.DateTimeFormat to convert ET to UTC properly
+                        const etDateStr = `${year}-${String(monthNum + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}T${String(hour).padStart(2, '0')}:00:00`;
+                        // Parse as ET time by creating a formatter and using its timezone offset
+                        const tempDate = new Date(etDateStr);
+                        // Get timezone offset for ET on this date
+                        const etOffset = new Date(tempDate.toLocaleString('en-US', { timeZone: 'America/New_York' })).getTime() -
+                                         new Date(tempDate.toLocaleString('en-US', { timeZone: 'UTC' })).getTime();
+                        const startTimeUTC = tempDate.getTime() - etOffset;
+                        endDate = startTimeUTC + (60 * 60 * 1000); // 1 hour from start
+
+                        debugLog(`HOURLY endDate calculated: ${slug} -> ${new Date(endDate).toISOString()}`);
+                    }
+                }
+
                 // Skip if expired
                 if (endDate && endDate < now - 60000) return;
 
@@ -395,8 +493,11 @@ async function proactivelyDiscoverMarkets(): Promise<void> {
                     discoveredMarkets.set(conditionId, newMarket);
                     proactivelyDiscoveredIds.add(conditionId);
 
+                    // CRITICAL: Ensure market exists in marketTracker with both assets for live price fetching
+                    marketTracker.ensureMarketWithAssets(marketKey, title, slug, conditionId, assetUp, assetDown, endDate);
+
                     const timeLeftMin = endDate ? Math.floor((endDate - now) / 60000) : 0;
-                    debugLog(`🎯 PROACTIVE DISCOVERY: ${marketKey} | ${slug} | ${timeLeftMin}m left`);
+                    debugLog(`🎯 PROACTIVE DISCOVERY: ${marketKey} | ${slug} | ${timeLeftMin}m left | assets: UP=${assetUp?.slice(0,8)}..., DOWN=${assetDown?.slice(0,8)}...`);
                     Logger.success(`🎯 PROACTIVE: Found ${marketKey} | ${timeLeftMin}m remaining`);
                 }
             }
@@ -416,7 +517,8 @@ async function proactivelyDiscoverMarkets(): Promise<void> {
 }
 
 /**
- * Get market key from title
+ * Get market key from title or slug
+ * MUST match marketTracker.extractMarketKey() for consistent market tracking
  */
 function getMarketKey(title: string): string {
     const lowerTitle = title.toLowerCase();
@@ -424,12 +526,29 @@ function getMarketKey(title: string): string {
     const isBTC = lowerTitle.includes('bitcoin') || lowerTitle.includes('btc');
     const isETH = lowerTitle.includes('ethereum') || lowerTitle.includes('eth');
     const is15Min = lowerTitle.includes('15') || /\d{1,2}:\d{2}\s*[-–]\s*\d{1,2}:\d{2}/i.test(title);
-    const isHourly = /\d{1,2}\s*(?:am|pm)\s*et/i.test(lowerTitle) && !is15Min;
+    // Handle both title format (with spaces: "5AM ET") and slug format (with hyphens: "5am-et")
+    const isHourly = (/\d{1,2}\s*(?:am|pm)\s*et/i.test(title) || /\d{1,2}(?:am|pm)-et/i.test(title)) && !is15Min;
+
+    // Extract hour for hourly markets - try both patterns
+    let hourMatch = title.match(/(\d{1,2})\s*(?:am|pm)\s*et/i);
+    if (!hourMatch) {
+        hourMatch = title.match(/(\d{1,2})(?:am|pm)-et/i);
+    }
 
     if (isBTC) {
-        return is15Min ? 'BTC-UpDown-15' : (isHourly ? 'BTC-UpDown-1h' : 'BTC-UpDown');
+        if (is15Min) return 'BTC-UpDown-15';
+        if (isHourly && hourMatch) {
+            return `BTC-UpDown-1h-${hourMatch[1]}`;
+        }
+        if (isHourly) return 'BTC-UpDown-1h';
+        return 'BTC-UpDown';
     } else if (isETH) {
-        return is15Min ? 'ETH-UpDown-15' : (isHourly ? 'ETH-UpDown-1h' : 'ETH-UpDown');
+        if (is15Min) return 'ETH-UpDown-15';
+        if (isHourly && hourMatch) {
+            return `ETH-UpDown-1h-${hourMatch[1]}`;
+        }
+        if (isHourly) return 'ETH-UpDown-1h';
+        return 'ETH-UpDown';
     }
 
     return 'Other';
@@ -551,10 +670,23 @@ async function discoverMarketsFromWatchers(): Promise<void> {
                     debugLog(`Updated endDate for ${existing.marketKey} from Gamma API: ${new Date(fetchedEndDate).toISOString()}`);
                 }
             }
+            // CRITICAL: If missing asset IDs, fetch from Gamma API for price fetching
+            if ((!existing.assetUp || !existing.assetDown) && (market.conditionId || existing.marketSlug)) {
+                const assets = await fetchMarketAssets(market.conditionId || '', existing.marketSlug);
+                if (assets) {
+                    existing.assetUp = assets.assetUp;
+                    existing.assetDown = assets.assetDown;
+                    // Also update marketTracker so it can fetch live prices
+                    marketTracker.updateMarketAssets(market.conditionId || '', assets.assetUp, assets.assetDown, existing.marketKey);
+                    debugLog(`Updated assets for ${existing.marketKey} from Gamma API`);
+                }
+            }
         } else {
             // New market from marketTracker
             let endDate = market.endDate || 0;
-            
+            let assetUp = market.assetUp || '';
+            let assetDown = market.assetDown || '';
+
             // If endDate is missing, try to fetch from Gamma API
             if ((!endDate || endDate === 0) && market.conditionId) {
                 const fetchedEndDate = await fetchMarketExpiration(market.conditionId);
@@ -563,20 +695,37 @@ async function discoverMarketsFromWatchers(): Promise<void> {
                     debugLog(`Fetched endDate for ${market.marketKey} from Gamma API: ${new Date(fetchedEndDate).toISOString()}`);
                 }
             }
-            
+
+            // CRITICAL: If missing asset IDs, fetch from Gamma API for price fetching
+            if ((!assetUp || !assetDown) && (market.conditionId || market.marketSlug)) {
+                const assets = await fetchMarketAssets(market.conditionId || '', market.marketSlug);
+                if (assets) {
+                    assetUp = assets.assetUp;
+                    assetDown = assets.assetDown;
+                    // Also update marketTracker so it can fetch live prices
+                    marketTracker.updateMarketAssets(market.conditionId || '', assets.assetUp, assets.assetDown, market.marketKey);
+                    debugLog(`Fetched assets for ${market.marketKey} from Gamma API`);
+                }
+            }
+
             const newMarket = {
                 conditionId: id,
                 marketKey: market.marketKey,
                 marketName: market.marketName,
                 marketSlug: market.marketSlug || '',
-                assetUp: market.assetUp || '',
-                assetDown: market.assetDown || '',
+                assetUp,
+                assetDown,
                 endDate: endDate,
                 priceUp: market.currentPriceUp || 0.5,
                 priceDown: market.currentPriceDown || 0.5,
                 lastUpdate: now,
             };
             discoveredMarkets.set(id, newMarket);
+
+            // CRITICAL: Ensure market exists in marketTracker with both assets for live price fetching
+            if (assetUp && assetDown) {
+                marketTracker.ensureMarketWithAssets(market.marketKey, market.marketName, market.marketSlug || '', id, assetUp, assetDown, endDate);
+            }
 
             // Calculate time remaining - handle both seconds and milliseconds
             let timeLeftMin = 0;
@@ -731,6 +880,18 @@ async function updatePrices(): Promise<void> {
             if (position) {
                 if (priceUp !== null) position.currentPriceUp = priceUp;
                 if (priceDown !== null) position.currentPriceDown = priceDown;
+            }
+
+            // CRITICAL: Sync prices AND assets to marketTracker for dashboard display
+            // This ensures the dashboard shows live prices like watcher mode
+            const trackerMarket = marketTracker.getMarkets().get(market.marketKey);
+            if (trackerMarket) {
+                if (priceUp !== null) trackerMarket.currentPriceUp = priceUp;
+                if (priceDown !== null) trackerMarket.currentPriceDown = priceDown;
+                trackerMarket.lastPriceUpdate = now;
+                // Also ensure assets are synced
+                if (market.assetUp) trackerMarket.assetUp = market.assetUp;
+                if (market.assetDown) trackerMarket.assetDown = market.assetDown;
             }
         }));
     }
@@ -1300,6 +1461,9 @@ async function logPaperTrade(
         usdcSize: cost.toString(),
         price: price.toString(),
         asset: side === 'UP' ? position.assetUp : position.assetDown,
+        // CRITICAL: Include BOTH asset IDs so marketTracker can fetch prices immediately
+        assetUp: position.assetUp,
+        assetDown: position.assetDown,
         side: action,
         outcomeIndex: side === 'UP' ? 0 : 1,
         outcome: side,
@@ -1317,32 +1481,28 @@ async function logPaperTrade(
 }
 
 /**
- * Display current status
+ * Display current status - informative dashboard like watcher mode
  */
 function displayStatus(): void {
     const now = Date.now();
-    const activePositions = Array.from(positions.values()).filter(p => !p.isSettled);
-    const withSplit = activePositions.filter(p => p.hasSplitPosition && !p.hasArbitragePosition);
-    const withArb = activePositions.filter(p => p.hasArbitragePosition);
+    const lines: string[] = [];
 
-    // Calculate total invested
-    let totalInvested = 0;
-    for (const pos of activePositions) {
-        totalInvested += pos.costUp + pos.costDown + pos.arbCostUp + pos.arbCostDown;
-    }
+    // Get current ET time for display
+    const etFormatter = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'America/New_York',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: true,
+    });
+    const etTime = etFormatter.format(new Date(now));
 
-    const portfolioValue = currentCapital + totalInvested;
-    const overallPnL = portfolioValue - PAPER_STARTING_CAPITAL + totalPnL;
-    const pnlPercent = (overallPnL / PAPER_STARTING_CAPITAL) * 100;
-
-    // Also count building positions
-    let buildingInvested = 0;
-    for (const [_, buildState] of buildingPositions.entries()) {
-        buildingInvested += buildState.investedUp + buildState.investedDown;
-    }
-
-    // Show paper bot's own status - use success for visibility
-    console.log(`\n🤖 PAPER ARB: Capital $${currentCapital.toFixed(2)} | Building: ${buildingPositions.size} | Positions: ${activePositions.length} | Trades: ${totalTrades}`);
+    // Header
+    lines.push(chalk.cyan('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
+    lines.push(chalk.cyan.bold(`  🤖 PAPER TRADING MODE                                         ${etTime} ET`));
+    lines.push(chalk.gray('  Strategy: Dual-side accumulation | Mirroring watcher patterns'));
+    lines.push(chalk.cyan('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
+    lines.push('');
 
     // Filter out expired markets and only show markets that correspond to current ET time
     // Only show the 4 active markets: current BTC 15m, current ETH 15m, current BTC 1h, current ETH 1h
@@ -1468,140 +1628,184 @@ function displayStatus(): void {
         groupedMarkets.get(baseCategory)!.push({ id, market: m });
     }
 
-    // Show discovered markets with their status (grouped)
+    // Track totals for summary
+    let totalInvested15m = 0, totalValue15m = 0, totalPnl15m = 0, totalTrades15m = 0;
+    let totalInvested1h = 0, totalValue1h = 0, totalPnl1h = 0, totalTrades1h = 0;
+
     if (groupedMarkets.size === 0) {
-        console.log(`   ⏳ Waiting for watcher to trade on new 15-min markets...`);
+        lines.push(chalk.yellow('  ⏳ Waiting for markets to be discovered...'));
+        lines.push('');
     }
 
-    // Sort categories: 15m first, then 1h, then others
+    // Sort categories: 15m first, then 1h
     const sortedCategories = Array.from(groupedMarkets.entries()).sort((a, b) => {
         const aIs15 = a[0].includes('-15');
         const bIs15 = b[0].includes('-15');
-        const aIs1h = a[0].includes('-1h');
-        const bIs1h = b[0].includes('-1h');
-        
         if (aIs15 && !bIs15) return -1;
         if (!aIs15 && bIs15) return 1;
-        if (aIs1h && !bIs1h) return -1;
-        if (!aIs1h && bIs1h) return 1;
         return a[0].localeCompare(b[0]);
     });
 
+    // Display each market in watcher-style format
     for (const [baseCategory, markets] of sortedCategories) {
-        // Aggregate stats for all markets in this category
-        let totalTrades = 0;
-        let totalInvestedUp = 0;
-        let totalTargetUp = 0;
-        let totalInvestedDown = 0;
-        let totalTargetDown = 0;
-        let hasAnyAssets = false;
-        let hasAnyPosition = false;
-        let hasAnyBuildState = false;
-        
         for (const { id, market: m } of markets) {
-            const hasAssets = m.assetUp && m.assetDown;
-            if (hasAssets) hasAnyAssets = true;
-            
-            const hasPosition = positions.has(id);
-            if (hasPosition) hasAnyPosition = true;
-            
             const buildState = buildingPositions.get(id);
-            if (buildState) {
-                hasAnyBuildState = true;
-                totalTrades += buildState.tradeCount;
-                totalInvestedUp += buildState.investedUp;
-                totalTargetUp += buildState.targetUp;
-                totalInvestedDown += buildState.investedDown;
-                totalTargetDown += buildState.targetDown;
-            } else if (hasPosition) {
-                const pos = positions.get(id)!;
-                totalTrades += 1; // Count as 1 trade for display
-            }
-        }
-        
-        // Calculate time until next market starts
-        // 15-minute markets start every 15 minutes (at :00, :15, :30, :45)
-        // 1-hour markets start every hour (at :00)
-        // Markets operate on ET/EST timezone
-        const is15MinMarket = baseCategory.includes('15');
-        
-        // Get current time in ET timezone
-        const etFormatter = new Intl.DateTimeFormat('en-US', {
-            timeZone: 'America/New_York',
-            hour: '2-digit',
-            minute: '2-digit',
-            second: '2-digit',
-            hour12: false,
-        });
-        
-        const etParts = etFormatter.formatToParts(new Date(now));
-        const currentMinutes = parseInt(etParts.find(p => p.type === 'minute')?.value || '0', 10);
-        const currentSeconds = parseInt(etParts.find(p => p.type === 'second')?.value || '0', 10);
-        
-        let minutesUntilNextMarket = 0;
-        if (is15MinMarket) {
-            // Find next 15-minute mark (:00, :15, :30, :45)
-            const next15MinMark = Math.ceil(currentMinutes / 15) * 15;
-            let minutesToAdd = next15MinMark - currentMinutes;
-            // If we're exactly on a 15-minute mark, next one is in 15 minutes
-            if (minutesToAdd === 0) {
-                minutesToAdd = 15;
-            }
-            // Add seconds remaining in current minute
-            const totalSecondsUntilNext = (minutesToAdd * 60) - currentSeconds;
-            minutesUntilNextMarket = Math.ceil(totalSecondsUntilNext / 60);
-        } else {
-            // 1-hour markets - find next hour mark
-            let minutesToNextHour = 60 - currentMinutes;
-            // If we're exactly on the hour, next one is in 60 minutes
-            if (minutesToNextHour === 0) {
-                minutesToNextHour = 60;
-            }
-            const totalSecondsUntilNextHour = (minutesToNextHour * 60) - currentSeconds;
-            minutesUntilNextMarket = Math.ceil(totalSecondsUntilNextHour / 60);
-        }
-        
-        const timeDisplay = `${minutesUntilNextMarket}m`;
-        
-        if (!hasAnyAssets) {
-            console.log(`   ⏳ ${baseCategory}: Waiting for assets (${markets.length} market${markets.length > 1 ? 's' : ''}) | Next market in ${timeDisplay}`);
-        } else if (hasAnyBuildState) {
-            // Show aggregated building progress
-            const upPct = totalTargetUp > 0 ? ((totalInvestedUp / totalTargetUp) * 100).toFixed(0) : '0';
-            const downPct = totalTargetDown > 0 ? ((totalInvestedDown / totalTargetDown) * 100).toFixed(0) : '0';
-            console.log(`   📈 ${baseCategory}: BUILDING ${totalTrades} trades | UP ${upPct}% DOWN ${downPct}% | Next market in ${timeDisplay} (${markets.length} market${markets.length > 1 ? 's' : ''})`);
-        } else if (hasAnyPosition) {
-            // Aggregate position info
-            let totalInv = 0;
-            let hasArb = false;
-            for (const { id } of markets) {
-                if (positions.has(id)) {
-                    const pos = positions.get(id)!;
-                    totalInv += pos.costUp + pos.costDown;
-                    if (pos.hasArbitragePosition) hasArb = true;
+            const position = positions.get(id);
+
+            // Get market data
+            const investedUp = buildState ? buildState.investedUp : (position?.costUp || 0);
+            const investedDown = buildState ? buildState.investedDown : (position?.costDown || 0);
+            const totalInvested = investedUp + investedDown;
+
+            // Get avg prices from build state or calculate from position
+            const avgPriceUp = buildState ? buildState.avgPriceUp : (position?.sharesUp ? position.costUp / position.sharesUp : 0);
+            const avgPriceDown = buildState ? buildState.avgPriceDown : (position?.sharesDown ? position.costDown / position.sharesDown : 0);
+
+            // Calculate shares from invested/avgPrice
+            const sharesUp = avgPriceUp > 0 ? investedUp / avgPriceUp : (position?.sharesUp || 0);
+            const sharesDown = avgPriceDown > 0 ? investedDown / avgPriceDown : (position?.sharesDown || 0);
+
+            // Get trade counts (buildState has tradeCount, split roughly evenly)
+            const totalTradeCount = buildState ? buildState.tradeCount : 0;
+            const tradesUp = Math.ceil(totalTradeCount / 2);
+            const tradesDown = Math.floor(totalTradeCount / 2);
+
+            // Get live prices
+            const liveUp = m.priceUp || 0;
+            const liveDown = m.priceDown || 0;
+            const hasValidPrices = liveUp > 0 && liveDown > 0;
+
+            // Calculate PnL
+            const currentValueUp = sharesUp * liveUp;
+            const currentValueDown = sharesDown * liveDown;
+            const pnlUp = currentValueUp - investedUp;
+            const pnlDown = currentValueDown - investedDown;
+            const totalPnl = pnlUp + pnlDown;
+            const totalCurrentValue = currentValueUp + currentValueDown;
+
+            // Calculate percentages
+            const upPercent = totalInvested > 0 ? (investedUp / totalInvested) * 100 : 50;
+            const downPercent = totalInvested > 0 ? (investedDown / totalInvested) * 100 : 50;
+
+            // Calculate time left
+            let timeLeftStr = '';
+            if (m.endDate && m.endDate > 0) {
+                const endDateMs = m.endDate < 10000000000 ? m.endDate * 1000 : m.endDate;
+                const timeLeftMs = endDateMs - now;
+                if (timeLeftMs > 0) {
+                    const mins = Math.floor(timeLeftMs / 60000);
+                    const secs = Math.floor((timeLeftMs % 60000) / 1000);
+                    timeLeftStr = `⏱️ ${mins}m ${secs}s left`;
+                } else {
+                    timeLeftStr = '⌛ Expired';
                 }
             }
-            const status = hasArb ? '✅ARB' : '⏳WAIT';
-            console.log(`   📊 ${baseCategory}: ${status} $${totalInv.toFixed(2)} | Next market in ${timeDisplay} (${markets.length} market${markets.length > 1 ? 's' : ''})`);
-        } else {
-            // Show average prices if available
-            let avgPriceUp = 0;
-            let avgPriceDown = 0;
-            let priceCount = 0;
-            for (const { market: m } of markets) {
-                if (m.priceUp && m.priceDown) {
-                    avgPriceUp += m.priceUp;
-                    avgPriceDown += m.priceDown;
-                    priceCount++;
-                }
+
+            // Track totals by market type
+            const is15m = m.marketKey.includes('-15');
+            if (is15m) {
+                totalInvested15m += totalInvested;
+                totalValue15m += totalCurrentValue;
+                totalPnl15m += hasValidPrices ? totalPnl : 0;
+                totalTrades15m += tradesUp + tradesDown;
+            } else {
+                totalInvested1h += totalInvested;
+                totalValue1h += totalCurrentValue;
+                totalPnl1h += hasValidPrices ? totalPnl : 0;
+                totalTrades1h += tradesUp + tradesDown;
             }
-            if (priceCount > 0) {
-                avgPriceUp /= priceCount;
-                avgPriceDown /= priceCount;
+
+            // Market header
+            lines.push(chalk.yellow(`┌─ ${m.marketKey} ${timeLeftStr}`));
+            lines.push(chalk.gray(`│  ${m.marketName.slice(0, 65)}`));
+
+            // UP line
+            const upLiveStr = hasValidPrices ? chalk.yellow.bold(`LIVE: $${liveUp.toFixed(4)}`) : chalk.gray('LIVE: fetching...');
+            const upPnlColor = pnlUp >= 0 ? chalk.green : chalk.red;
+            const upPnlStr = hasValidPrices ? upPnlColor(`${pnlUp >= 0 ? '+' : ''}$${pnlUp.toFixed(2)} (${investedUp > 0 ? ((pnlUp/investedUp)*100).toFixed(1) : '0.0'}%)`) : '';
+            lines.push(chalk.gray(`│  `) + chalk.green('📈 UP:   ') + chalk.white(`${sharesUp.toFixed(2)} shares | $${investedUp.toFixed(2)} @ $${avgPriceUp.toFixed(4)} avg | `) + upLiveStr + chalk.white(' | ') + upPnlStr + chalk.gray(` | ${tradesUp} trades`));
+
+            // DOWN line
+            const downLiveStr = hasValidPrices ? chalk.yellow.bold(`LIVE: $${liveDown.toFixed(4)}`) : chalk.gray('LIVE: fetching...');
+            const downPnlColor = pnlDown >= 0 ? chalk.green : chalk.red;
+            const downPnlStr = hasValidPrices ? downPnlColor(`${pnlDown >= 0 ? '+' : ''}$${pnlDown.toFixed(2)} (${investedDown > 0 ? ((pnlDown/investedDown)*100).toFixed(1) : '0.0'}%)`) : '';
+            lines.push(chalk.gray(`│  `) + chalk.red('📉 DOWN: ') + chalk.white(`${sharesDown.toFixed(2)} shares | $${investedDown.toFixed(2)} @ $${avgPriceDown.toFixed(4)} avg | `) + downLiveStr + chalk.white(' | ') + downPnlStr + chalk.gray(` | ${tradesDown} trades`));
+
+            // Live price sum check
+            if (hasValidPrices) {
+                const liveSum = liveUp + liveDown;
+                const sumStatus = Math.abs(liveSum - 1.0) < 0.02 ? chalk.green('✓') : chalk.yellow('⚠️');
+                lines.push(chalk.gray(`│  💵 Live Prices: UP $${liveUp.toFixed(4)} + DOWN $${liveDown.toFixed(4)} = $${liveSum.toFixed(4)} `) + sumStatus);
             }
-            console.log(`   🎯 ${baseCategory}: READY | Next market in ${timeDisplay} | UP:${avgPriceUp > 0 ? avgPriceUp.toFixed(2) : 'N/A'} DOWN:${avgPriceDown > 0 ? avgPriceDown.toFixed(2) : 'N/A'} (${markets.length} market${markets.length > 1 ? 's' : ''})`);
+
+            // Summary line with PnL
+            const pnlSign = totalPnl >= 0 ? '+' : '';
+            const pnlPct = totalInvested > 0 ? ((totalPnl / totalInvested) * 100).toFixed(1) : '0.0';
+            const totalPnlColor = totalPnl >= 0 ? chalk.green : chalk.red;
+            if (hasValidPrices) {
+                lines.push(chalk.gray(`│  💰 Invested: $${totalInvested.toFixed(2)} | Value: $${totalCurrentValue.toFixed(2)} | PnL: `) + totalPnlColor(`${pnlSign}$${totalPnl.toFixed(2)} (${pnlSign}${pnlPct}%)`));
+            } else {
+                lines.push(chalk.gray(`│  💰 Total Invested: $${totalInvested.toFixed(2)} | ${tradesUp + tradesDown} trades`));
+            }
+
+            // Visual bar - colorful like watcher mode
+            const barLength = 40;
+            const upBars = Math.round((upPercent / 100) * barLength);
+            const downBars = barLength - upBars;
+            const upBar = chalk.green('█'.repeat(upBars));
+            const downBar = chalk.red('█'.repeat(downBars));
+            lines.push(chalk.gray(`│  [`) + upBar + downBar + chalk.gray(`] `) + chalk.green(`${upPercent.toFixed(1)}% UP`) + chalk.gray(' / ') + chalk.red(`${downPercent.toFixed(1)}% DOWN`));
+            lines.push(chalk.yellow('└' + '─'.repeat(80)));
+            lines.push('');
         }
     }
+
+    // Portfolio Summary Section
+    lines.push(chalk.cyan('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
+    lines.push(chalk.cyan.bold('  📊 PORTFOLIO SUMMARY'));
+
+    // 15-minute markets summary
+    const pnl15mSign = totalPnl15m >= 0 ? '+' : '';
+    const pnl15mPct = totalInvested15m > 0 ? ((totalPnl15m / totalInvested15m) * 100).toFixed(2) : '0.00';
+    const pnl15mColor = totalPnl15m >= 0 ? chalk.green : chalk.red;
+    lines.push('');
+    lines.push(chalk.white.bold('  ⏱️  15-Minute Markets (BTC + ETH)'));
+    lines.push(chalk.gray(`    Invested: $${totalInvested15m.toFixed(2)} | Value: $${totalValue15m.toFixed(2)} | PnL: `) + pnl15mColor(`${pnl15mSign}$${totalPnl15m.toFixed(2)} (${pnl15mSign}${pnl15mPct}%)`) + chalk.gray(` | Trades: ${totalTrades15m}`));
+
+    // 1-hour markets summary
+    const pnl1hSign = totalPnl1h >= 0 ? '+' : '';
+    const pnl1hPct = totalInvested1h > 0 ? ((totalPnl1h / totalInvested1h) * 100).toFixed(2) : '0.00';
+    const pnl1hColor = totalPnl1h >= 0 ? chalk.green : chalk.red;
+    lines.push('');
+    lines.push(chalk.white.bold('  🕐 1-Hour Markets (BTC + ETH)'));
+    lines.push(chalk.gray(`    Invested: $${totalInvested1h.toFixed(2)} | Value: $${totalValue1h.toFixed(2)} | PnL: `) + pnl1hColor(`${pnl1hSign}$${totalPnl1h.toFixed(2)} (${pnl1hSign}${pnl1hPct}%)`) + chalk.gray(` | Trades: ${totalTrades1h}`));
+
+    // Total summary
+    const totalInvestedAll = totalInvested15m + totalInvested1h;
+    const totalValueAll = totalValue15m + totalValue1h;
+    const totalPnlAll = totalPnl15m + totalPnl1h;
+    const totalTradesAll = totalTrades15m + totalTrades1h;
+    const totalPnlSign = totalPnlAll >= 0 ? '+' : '';
+    const totalPnlPct = totalInvestedAll > 0 ? ((totalPnlAll / totalInvestedAll) * 100).toFixed(2) : '0.00';
+    const totalPnlAllColor = totalPnlAll >= 0 ? chalk.green : chalk.red;
+
+    lines.push('');
+    lines.push(chalk.yellow.bold('  📈 TOTAL (All Markets)'));
+    lines.push(chalk.white(`    Capital: $${currentCapital.toFixed(2)} | Invested: $${totalInvestedAll.toFixed(2)} | Value: $${totalValueAll.toFixed(2)}`));
+    lines.push(chalk.gray('    PnL: ') + totalPnlAllColor.bold(`${totalPnlSign}$${totalPnlAll.toFixed(2)} (${totalPnlSign}${totalPnlPct}%)`) + chalk.gray(` | Total Trades: ${totalTradesAll}`));
+
+    // Realized PnL from settled positions
+    if (totalPnL !== 0) {
+        const realizedSign = totalPnL >= 0 ? '+' : '';
+        const realizedColor = totalPnL >= 0 ? chalk.green : chalk.red;
+        lines.push(chalk.gray('    Realized PnL (from settled): ') + realizedColor(`${realizedSign}$${totalPnL.toFixed(2)}`));
+    }
+
+    lines.push(chalk.cyan('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
+    lines.push('');
+
+    // Output everything at once
+    console.log(lines.join('\n'));
 }
 
 /**
@@ -1673,13 +1877,29 @@ const paperTradeMonitor = async () => {
 
     let lastDisplayTime = 0;
     let lastCleanupTime = 0;
-    const DISPLAY_INTERVAL_MS = 5000;
+    const DISPLAY_INTERVAL_MS = 1500; // Refresh dashboard every 1.5s (prices update faster in background)
     const CLEANUP_INTERVAL_MS = 30000; // Clean up expired markets every 30 seconds
     let loopCount = 0;
 
     // Do initial cleanup
     Logger.info('🧹 Cleaning up any expired markets...');
     await cleanupExpiredMarketsAndPositions();
+
+    // Start a separate fast price update loop (runs in parallel with main loop)
+    const FAST_PRICE_UPDATE_MS = 250; // Update prices every 250ms
+    let priceUpdateRunning = true;
+    const fastPriceUpdateLoop = async () => {
+        while (priceUpdateRunning && isRunning) {
+            try {
+                await updatePrices();
+            } catch (e) {
+                // Silent fail - don't let price updates crash the bot
+            }
+            await new Promise(resolve => setTimeout(resolve, FAST_PRICE_UPDATE_MS));
+        }
+    };
+    // Start the fast price update loop (don't await - runs in background)
+    fastPriceUpdateLoop();
 
     while (isRunning) {
         try {
@@ -1710,8 +1930,8 @@ const paperTradeMonitor = async () => {
                 debugLog(`✓ discoveredMarkets has ${discoveredMarkets.size} markets`);
             }
 
-            // Update prices for all discovered markets
-            await updatePrices();
+            // NOTE: Price updates now run in a separate fast loop (every 250ms)
+            // No need to call updatePrices() here - it runs in parallel
 
             // Process each discovered market
             debugLog(`Processing ${discoveredMarkets.size} discovered markets...`);
@@ -1756,21 +1976,13 @@ const paperTradeMonitor = async () => {
                 }
             }
 
-            // Log discovered markets count periodically
-            if (now - lastDisplayTime >= DISPLAY_INTERVAL_MS && discoveredMarkets.size === 0) {
-                Logger.info(`🔍 No markets discovered yet. Watching ${USER_ADDRESSES.length} trader(s)...`);
-            }
-
             // Settle expired positions
             await settlePositions();
 
-            // Display status periodically
-            // NOTE: marketTracker.displayStats() clears the screen, so we need to
-            // display our status AFTER it, or integrate into marketTracker's display
+            // Display status periodically - use single screen refresh
             if (now - lastDisplayTime >= DISPLAY_INTERVAL_MS) {
-                // First let marketTracker clear screen and show its display
-                await marketTracker.displayStats();
-                // Then show paper bot status on top (marketTracker already cleared screen)
+                // Clear screen and display everything at once
+                process.stdout.write('\x1b[2J\x1b[0f');
                 displayStatus();
                 lastDisplayTime = now;
             }
@@ -1784,6 +1996,9 @@ const paperTradeMonitor = async () => {
             await new Promise((resolve) => setTimeout(resolve, 2000));
         }
     }
+
+    // Stop the fast price update loop
+    priceUpdateRunning = false;
 
     displayStatus();
     Logger.info('Paper trade monitor stopped');

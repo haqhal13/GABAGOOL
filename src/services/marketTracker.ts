@@ -1237,24 +1237,54 @@ class MarketTracker {
         const isPaperTrade = activity.transactionHash && activity.transactionHash.startsWith('paper-');
         const shouldTrackPosition = this.displayMode !== 'PAPER' || isPaperTrade;
 
-        // Only accumulate on BUY; SELL just registers market presence
-        if (side === 'BUY' && shouldTrackPosition) {
-            if (isUp) {
-                market.sharesUp += shares;
-                market.investedUp += invested;
-                market.totalCostUp += cost;
-                market.tradesUp += 1;
-            } else {
-                market.sharesDown += shares;
-                market.investedDown += invested;
-                market.totalCostDown += cost;
-                market.tradesDown += 1;
+        if (shouldTrackPosition) {
+            if (side === 'BUY') {
+                // BUY: Add shares and cost basis
+                if (isUp) {
+                    market.sharesUp += shares;
+                    market.investedUp += invested;
+                    market.totalCostUp += cost;
+                    market.tradesUp += 1;
+                } else {
+                    market.sharesDown += shares;
+                    market.investedDown += invested;
+                    market.totalCostDown += cost;
+                    market.tradesDown += 1;
+                }
+            } else if (side === 'SELL') {
+                // SELL: Reduce shares and cost basis proportionally using average cost method
+                if (isUp && market.sharesUp > 0) {
+                    // Calculate average cost per share before selling
+                    const avgCostPerShare = market.totalCostUp / market.sharesUp;
+                    // Calculate cost basis of shares being sold (can't sell more than we have)
+                    const sharesToSell = Math.min(shares, market.sharesUp);
+                    const costBasisOfSale = sharesToSell * avgCostPerShare;
+                    
+                    // Reduce shares and cost basis proportionally
+                    market.sharesUp = Math.max(0, market.sharesUp - sharesToSell);
+                    market.totalCostUp = Math.max(0, market.totalCostUp - costBasisOfSale);
+                    // Note: investedUp represents total capital deployed (historical), we keep it unchanged
+                    // Only totalCostUp (current cost basis) is reduced
+                } else if (!isUp && market.sharesDown > 0) {
+                    // Calculate average cost per share before selling
+                    const avgCostPerShare = market.totalCostDown / market.sharesDown;
+                    // Calculate cost basis of shares being sold (can't sell more than we have)
+                    const sharesToSell = Math.min(shares, market.sharesDown);
+                    const costBasisOfSale = sharesToSell * avgCostPerShare;
+                    
+                    // Reduce shares and cost basis proportionally
+                    market.sharesDown = Math.max(0, market.sharesDown - sharesToSell);
+                    market.totalCostDown = Math.max(0, market.totalCostDown - costBasisOfSale);
+                    // Note: investedDown represents total capital deployed (historical), we keep it unchanged
+                    // Only totalCostDown (current cost basis) is reduced
+                }
+                // Note: We don't increment trade counters for SELL trades to keep them as BUY-only counters
             }
             
             // Mark this trade as processed to prevent double-counting
             this.processedTrades.add(tradeId);
         } else {
-            // For SELL trades or watcher trades in PAPER mode, mark as processed but don't add positions
+            // For watcher trades in PAPER mode, mark as processed but don't add positions
             this.processedTrades.add(tradeId);
         }
 
@@ -1551,7 +1581,7 @@ class MarketTracker {
         if (this.displayMode === 'PAPER') {
             // Paper mode header - show paper trading info
             // Calculate paper mode capital from tracked markets
-            const paperStartingCapital = parseFloat(process.env.PAPER_STARTING_CAPITAL || '1000.0');
+            const paperStartingCapital = parseFloat(process.env.PAPER_STARTING_CAPITAL || '10000');
             // Calculate current capital and portfolio value from market positions
             let paperCurrentCapital = paperStartingCapital;
             let paperPortfolioValue = 0;

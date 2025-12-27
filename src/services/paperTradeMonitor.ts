@@ -428,16 +428,58 @@ async function proactivelyDiscoverMarkets(): Promise<void> {
 
     if (windowChanged || hourChanged) {
         fetchedSlugs.clear();
-        // Also clear any expired markets from discoveredMarkets to force re-fetch
+
+        // ==========================================================================
+        // CRITICAL FIX: Clean up ALL markets from PREVIOUS window, not just expired!
+        // When a new window starts, ALL positions from the old window must be finalized
+        // and removed to prevent carryover confusion.
+        // ==========================================================================
+
+        Logger.info(`🔄 New ${windowChanged ? '15-min window' : 'hour'} detected! Cleaning up ALL old positions...`);
+
         for (const [id, market] of discoveredMarkets.entries()) {
-            if (market.endDate && market.endDate <= now) {
+            // Convert endDate to ms if needed
+            const endDateMs = market.endDate && market.endDate < 10000000000
+                ? market.endDate * 1000
+                : market.endDate;
+
+            // Check if market belongs to PREVIOUS window (endDate <= currentWindowStart for 15m, or expired for 1h)
+            // OR if market is expired
+            const is15m = market.marketKey.includes('-15');
+            const belongsToPreviousWindow = is15m
+                ? (endDateMs && endDateMs <= currentWindowStart) // 15m market from before this window
+                : (endDateMs && endDateMs <= now); // 1h market that's expired
+
+            const isExpired = endDateMs && endDateMs <= now;
+
+            if (belongsToPreviousWindow || isExpired) {
+                // Finalize any building position before removing
+                const buildState = buildingPositions.get(id);
+                if (buildState) {
+                    if (buildState.investedUp > 0 || buildState.investedDown > 0) {
+                        debugLog(`🔄 Window changed: Finalizing ${market.marketKey} (invested: UP $${buildState.investedUp.toFixed(2)}, DOWN $${buildState.investedDown.toFixed(2)})`);
+                        // Reclaim invested capital (will be settled later)
+                        currentCapital += buildState.investedUp + buildState.investedDown;
+                    }
+                    buildingPositions.delete(id);
+                }
                 discoveredMarkets.delete(id);
-                debugLog(`🗑️ Removed expired market: ${market.marketKey}`);
+                debugLog(`🗑️ Removed old market: ${market.marketKey} | slug=${market.marketSlug} | endDate=${endDateMs ? new Date(endDateMs).toISOString() : 'none'}`);
             }
         }
+
+        // Also clean up any orphaned building positions (safety net)
+        for (const [id, buildState] of buildingPositions.entries()) {
+            if (!discoveredMarkets.has(id)) {
+                debugLog(`🗑️ Removed orphaned building position: ${buildState.marketKey}`);
+                currentCapital += buildState.investedUp + buildState.investedDown;
+                buildingPositions.delete(id);
+            }
+        }
+
         lastProcessedWindow = currentWindowStart;
         lastHourProcessed = currentHourET;
-        Logger.info(`🔄 New ${windowChanged ? '15-min window' : 'hour'} detected! Scanning for new markets...`);
+        Logger.info(`✅ Cleanup complete. Ready for new markets. Capital: $${currentCapital.toFixed(2)}`);
     }
 
     // PRE-FETCH: Check how much time is left in current window
@@ -689,6 +731,26 @@ async function proactivelyDiscoverMarkets(): Promise<void> {
                 };
 
                 if (!discoveredMarkets.has(conditionId)) {
+                    // ==========================================================================
+                    // CRITICAL: Before adding NEW market, clean up OLD markets with same marketKey
+                    // This prevents stale trades from carrying over to new market windows
+                    // ==========================================================================
+                    for (const [oldId, oldMarket] of discoveredMarkets.entries()) {
+                        if (oldMarket.marketKey === marketKey && oldId !== conditionId) {
+                            // Finalize and clean up old position
+                            const oldBuildState = buildingPositions.get(oldId);
+                            if (oldBuildState) {
+                                if (oldBuildState.investedUp > 0 || oldBuildState.investedDown > 0) {
+                                    debugLog(`🔄 New market replacing old: ${marketKey} | Finalizing old position (UP $${oldBuildState.investedUp.toFixed(2)}, DOWN $${oldBuildState.investedDown.toFixed(2)})`);
+                                    currentCapital += oldBuildState.investedUp + oldBuildState.investedDown;
+                                }
+                                buildingPositions.delete(oldId);
+                            }
+                            discoveredMarkets.delete(oldId);
+                            debugLog(`🗑️ Removed old ${marketKey} market (slug=${oldMarket.marketSlug}) to make room for new (slug=${slug})`);
+                        }
+                    }
+
                     discoveredMarkets.set(conditionId, newMarket);
                     proactivelyDiscoveredIds.add(conditionId);
 
@@ -919,6 +981,27 @@ async function discoverMarketsFromWatchers(): Promise<void> {
                 priceDown: market.currentPriceDown || 0.5,
                 lastUpdate: now,
             };
+
+            // ==========================================================================
+            // CRITICAL: Before adding NEW market, clean up OLD markets with same marketKey
+            // This prevents stale trades from carrying over to new market windows
+            // ==========================================================================
+            for (const [oldId, oldMarket] of discoveredMarkets.entries()) {
+                if (oldMarket.marketKey === market.marketKey && oldId !== id) {
+                    // Finalize and clean up old position
+                    const oldBuildState = buildingPositions.get(oldId);
+                    if (oldBuildState) {
+                        if (oldBuildState.investedUp > 0 || oldBuildState.investedDown > 0) {
+                            debugLog(`🔄 Watcher found new market replacing old: ${market.marketKey} | Finalizing old (UP $${oldBuildState.investedUp.toFixed(2)}, DOWN $${oldBuildState.investedDown.toFixed(2)})`);
+                            currentCapital += oldBuildState.investedUp + oldBuildState.investedDown;
+                        }
+                        buildingPositions.delete(oldId);
+                    }
+                    discoveredMarkets.delete(oldId);
+                    debugLog(`🗑️ Removed old ${market.marketKey} (slug=${oldMarket.marketSlug}) for new (slug=${market.marketSlug})`);
+                }
+            }
+
             discoveredMarkets.set(id, newMarket);
 
             // CRITICAL: Ensure market exists in marketTracker with both assets for live price fetching
@@ -1106,6 +1189,27 @@ async function buildPositionIncrementally(market: typeof discoveredMarkets exten
     const positionKey = market.conditionId;
     const now = Date.now();
 
+    // ==========================================================================
+    // CRITICAL: MARKET VALIDITY CHECK - Prevent trades on wrong market window!
+    // This catches cases where:
+    // 1. Market has expired but hasn't been cleaned up yet
+    // 2. Trade was scheduled before window change but executes after
+    // 3. Stale market reference from previous iteration
+    // ==========================================================================
+
+    // First, verify this market still exists in discoveredMarkets
+    if (!discoveredMarkets.has(positionKey)) {
+        debugLog(`buildPosition: ${market.marketKey} - SKIPPED (market no longer in discoveredMarkets)`);
+        // Clean up any orphaned building position
+        const orphanedState = buildingPositions.get(positionKey);
+        if (orphanedState) {
+            currentCapital += orphanedState.investedUp + orphanedState.investedDown;
+            buildingPositions.delete(positionKey);
+            debugLog(`buildPosition: Cleaned up orphaned position for ${market.marketKey}`);
+        }
+        return;
+    }
+
     // Skip if we don't have both assets
     if (!market.assetUp || !market.assetDown) {
         if (!discoveredConditionIds.has(`skip-assets-${positionKey}`)) {
@@ -1125,6 +1229,20 @@ async function buildPositionIncrementally(market: typeof discoveredMarkets exten
         // If endDate is less than 10000000000, it's likely in seconds, convert to ms
         const endDateMs = market.endDate < 10000000000 ? market.endDate * 1000 : market.endDate;
         const timeToExpiration = endDateMs - now;
+
+        // CRITICAL: If market has ALREADY EXPIRED, skip immediately and clean up
+        if (timeToExpiration <= 0) {
+            debugLog(`buildPosition: ${market.marketKey} - EXPIRED (${Math.abs(timeToExpiration/1000).toFixed(0)}s ago), cleaning up`);
+            const buildState = buildingPositions.get(positionKey);
+            if (buildState && buildState.investedUp > 0 && buildState.investedDown > 0 && !positions.has(positionKey)) {
+                await finalizePosition(market, buildState);
+            }
+            // Remove from discoveredMarkets to prevent future allocation
+            discoveredMarkets.delete(positionKey);
+            buildingPositions.delete(positionKey);
+            return;
+        }
+
         if (timeToExpiration < EXPIRATION_WINDOW_MS) {
             // Position building complete, finalize if we have any investment
             const buildState = buildingPositions.get(positionKey);
@@ -1380,6 +1498,25 @@ async function buildPositionIncrementally(market: typeof discoveredMarkets exten
         tradeDown *= scale;
         sharesUp = tradeUp / market.priceUp;
         sharesDown = tradeDown / market.priceDown;
+    }
+
+    // ==========================================================================
+    // FINAL SAFETY CHECK: Re-verify market validity right before trade execution
+    // This catches race conditions where market expired during trade calculation
+    // ==========================================================================
+    const tradeNow = Date.now();
+    if (market.endDate && market.endDate > 0) {
+        const endDateMs = market.endDate < 10000000000 ? market.endDate * 1000 : market.endDate;
+        if (tradeNow >= endDateMs) {
+            debugLog(`buildPosition: ${market.marketKey} - ABORTED trade (market expired during calculation)`);
+            return;
+        }
+    }
+
+    // Also verify market is still in discoveredMarkets (may have been cleaned up)
+    if (!discoveredMarkets.has(positionKey)) {
+        debugLog(`buildPosition: ${market.marketKey} - ABORTED trade (market removed during calculation)`);
+        return;
     }
 
     // Execute UP trade (minimum 0.5 shares like watcher)
@@ -2255,9 +2392,21 @@ const paperTradeMonitor = async () => {
             for (const [conditionId, market] of discoveredMarkets.entries()) {
                 // Only skip if endDate is set AND has passed
                 // If endDate is 0/undefined, we still process the market
-                if (market.endDate && market.endDate > 0 && market.endDate <= now) {
-                    debugLog(`  SKIP ${market.marketKey}: expired (endDate ${new Date(market.endDate).toISOString()} <= now)`);
-                    continue;
+                // CRITICAL: Handle both seconds and milliseconds format
+                if (market.endDate && market.endDate > 0) {
+                    const endDateMs = market.endDate < 10000000000 ? market.endDate * 1000 : market.endDate;
+                    if (endDateMs <= now) {
+                        debugLog(`  SKIP ${market.marketKey}: expired (endDate ${new Date(endDateMs).toISOString()} <= now)`);
+                        // CRITICAL: Also remove expired market from discoveredMarkets and clean up position
+                        const buildState = buildingPositions.get(conditionId);
+                        if (buildState && buildState.investedUp > 0 && buildState.investedDown > 0 && !positions.has(conditionId)) {
+                            // Finalize before cleanup
+                            await finalizePosition(market, buildState);
+                        }
+                        buildingPositions.delete(conditionId);
+                        discoveredMarkets.delete(conditionId);
+                        continue;
+                    }
                 }
 
                 // Look up position by conditionId (unique per market instance)

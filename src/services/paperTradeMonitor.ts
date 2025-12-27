@@ -435,32 +435,13 @@ async function proactivelyDiscoverMarkets(): Promise<void> {
         Logger.info(`🔄 New ${windowChanged ? '15-min window' : 'hour'} detected! Scanning for new markets...`);
 
         // =======================================================================
-        // CRITICAL FIX: Finalize OLD 15-min buildStates when window changes
-        // This prevents trades from old windows being counted in new windows
-        // Markets stay visible for display, but trading is STOPPED immediately
+        // NOTE: We do NOT delete buildStates here - they need to remain visible
+        // until the market timer fully expires. The buildPositionIncrementally
+        // function already checks for old windows and skips trading on them.
+        // buildStates are only deleted when the market's endDate passes (line ~475)
         // =======================================================================
         if (windowChanged) {
-            for (const [id, market] of discoveredMarkets.entries()) {
-                if (!market.marketKey.includes('-15')) continue;
-                if (!market.marketSlug) continue;
-
-                const slugMatch = market.marketSlug.match(/updown-15m-(\d+)/);
-                if (!slugMatch) continue;
-
-                const marketStartTimestamp = parseInt(slugMatch[1], 10) * 1000;
-
-                // If this market started before the current window, finalize its buildState
-                if (marketStartTimestamp < currentWindowStart) {
-                    const buildState = buildingPositions.get(id);
-                    if (buildState && (buildState.investedUp > 0 || buildState.investedDown > 0)) {
-                        debugLog(`🔄 Window change: Finalizing OLD market ${market.marketKey} (${buildState.tradeCount} trades, UP $${buildState.investedUp.toFixed(2)}, DOWN $${buildState.investedDown.toFixed(2)})`);
-                        // Return capital (position is finalized)
-                        currentCapital += buildState.investedUp + buildState.investedDown;
-                        buildingPositions.delete(id);
-                        Logger.info(`📊 Finalized: ${market.marketKey} | ${buildState.tradeCount} trades | UP $${buildState.investedUp.toFixed(2)} / DOWN $${buildState.investedDown.toFixed(2)}`);
-                    }
-                }
-            }
+            debugLog(`🔄 Window changed to ${new Date(currentWindowStart).toISOString()} - old markets will stop trading but remain visible`);
         }
     }
 
@@ -595,8 +576,8 @@ async function proactivelyDiscoverMarkets(): Promise<void> {
         btcHourlyCurrent, ethHourlyCurrent, btcHourlyNext, ethHourlyNext
     ];
 
-    // Log what we're looking for - use Logger.info so it's visible
-    Logger.info(`🔍 Checking: ${btcSlugCurrent.split('-').pop()}, ${ethSlugCurrent.split('-').pop()} | cache: ${fetchedSlugs.size} | discovered: ${discoveredMarkets.size}`);
+    // Log what we're looking for - use debugLog to avoid terminal spam
+    debugLog(`🔍 Checking: ${btcSlugCurrent.split('-').pop()}, ${ethSlugCurrent.split('-').pop()} | cache: ${fetchedSlugs.size} | discovered: ${discoveredMarkets.size}`);
 
     // Fetch markets in parallel for speed
     const fetchPromises = slugsToCheck.map(async (slug) => {
@@ -2416,7 +2397,7 @@ const paperTradeMonitor = async () => {
 
     let lastDisplayTime = 0;
     let lastCleanupTime = 0;
-    const DISPLAY_INTERVAL_MS = 3000; // Refresh dashboard every 3s to reduce flickering
+    const DISPLAY_INTERVAL_MS = 1000; // Refresh dashboard every 1s
     const CLEANUP_INTERVAL_MS = 30000; // Clean up expired markets every 30 seconds
     let loopCount = 0;
 

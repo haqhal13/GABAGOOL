@@ -2239,132 +2239,218 @@ class MarketTracker {
     /**
      * Proactively discover 15-minute markets from Gamma API
      * This ensures new markets appear on dashboard immediately, even before trader trades
+     * Matches paper mode's aggressive discovery technique
      */
     private lastProactiveDiscovery = 0;
-    private proactiveDiscoveryInterval = 5000; // Check every 5 seconds
+    private proactiveDiscoveryInterval = 1000; // Check every 1 second for fast switching
+    private discoveredSlugs: Set<string> = new Set(); // Track already discovered slugs
 
     async proactivelyDiscover15MinMarkets(): Promise<void> {
         const now = Date.now();
 
-        // Rate limit: only check every 5 seconds
+        // Rate limit: check every 1 second
         if (now - this.lastProactiveDiscovery < this.proactiveDiscoveryInterval) {
             return;
         }
         this.lastProactiveDiscovery = now;
 
-        // Calculate current 15-min window start
+        // Calculate current AND next 15-min window starts (like paper mode)
         const current15MinStart = Math.floor(now / (15 * 60 * 1000)) * (15 * 60 * 1000);
+        const next15MinStart = current15MinStart + (15 * 60 * 1000);
         const current15MinTimestamp = Math.floor(current15MinStart / 1000);
+        const next15MinTimestamp = Math.floor(next15MinStart / 1000);
 
-        // Generate expected slugs for current window
+        // Generate expected slugs for BOTH current and next windows
         const slugsToCheck = [
             `btc-updown-15m-${current15MinTimestamp}`,
             `eth-updown-15m-${current15MinTimestamp}`,
+            `btc-updown-15m-${next15MinTimestamp}`,
+            `eth-updown-15m-${next15MinTimestamp}`,
         ];
 
-        for (const slug of slugsToCheck) {
-            // Check if we already have this market
-            const isBTC = slug.includes('btc');
-            const marketKey = isBTC ? 'BTC-UpDown-15' : 'ETH-UpDown-15';
-            const existingMarket = this.markets.get(marketKey);
+        // Also check for hourly markets
+        const etFormatter = new Intl.DateTimeFormat('en-US', {
+            timeZone: 'America/New_York',
+            year: 'numeric',
+            month: 'long',
+            day: 'numeric',
+            hour: 'numeric',
+            hour12: true,
+        });
+        const etParts = etFormatter.formatToParts(new Date(now));
+        const month = etParts.find(p => p.type === 'month')?.value?.toLowerCase() || '';
+        const day = etParts.find(p => p.type === 'day')?.value || '';
+        const hour = parseInt(etParts.find(p => p.type === 'hour')?.value || '0', 10);
+        const ampm = etParts.find(p => p.type === 'dayPeriod')?.value?.toLowerCase() || 'am';
 
-            // Skip if we already have this exact slug
-            if (existingMarket && existingMarket.marketSlug === slug) {
-                continue;
+        // Current and next hour slugs
+        const currentHourSlug = `${hour}${ampm}`;
+        const nextHour = ampm === 'am' && hour === 11 ? 12 : ampm === 'pm' && hour === 11 ? 12 : (hour % 12) + 1;
+        const nextAmpm = ampm === 'am' && hour === 11 ? 'pm' : ampm === 'pm' && hour === 11 ? 'am' : ampm;
+        const nextHourSlug = `${nextHour}${nextAmpm}`;
+
+        slugsToCheck.push(
+            `bitcoin-up-or-down-${month}-${day}-${currentHourSlug}-et`,
+            `ethereum-up-or-down-${month}-${day}-${currentHourSlug}-et`,
+            `bitcoin-up-or-down-${month}-${day}-${nextHourSlug}-et`,
+            `ethereum-up-or-down-${month}-${day}-${nextHourSlug}-et`,
+        );
+
+        // Fetch all slugs in parallel for speed
+        const fetchPromises = slugsToCheck.map(async (slug) => {
+            // Skip if already discovered this exact slug
+            if (this.discoveredSlugs.has(slug)) {
+                return null;
             }
 
-            // Skip if existing market is still valid (not expired)
-            if (existingMarket && existingMarket.endDate && existingMarket.endDate > now) {
-                // Check if this is from the current window
+            // Determine market key
+            const isBTC = slug.includes('btc') || slug.includes('bitcoin');
+            const is15Min = slug.includes('updown-15m');
+            let marketKey: string;
+
+            if (is15Min) {
+                marketKey = isBTC ? 'BTC-UpDown-15' : 'ETH-UpDown-15';
+            } else {
+                // Hourly - extract hour for unique key
+                const hourMatch = slug.match(/(\d+)(am|pm)-et$/i);
+                const hourNum = hourMatch ? hourMatch[1] : '0';
+                marketKey = isBTC ? `BTC-UpDown-1h-${hourNum}` : `ETH-UpDown-1h-${hourNum}`;
+            }
+
+            // Check if we already have this exact slug in markets
+            const existingMarket = this.markets.get(marketKey);
+            if (existingMarket && existingMarket.marketSlug === slug) {
+                this.discoveredSlugs.add(slug);
+                return null;
+            }
+
+            // For 15-min markets, check if existing is from current window
+            if (is15Min && existingMarket && existingMarket.endDate && existingMarket.endDate > now) {
                 const existingTimestamp = existingMarket.marketSlug?.match(/updown-15m-(\d+)/)?.[1];
-                if (existingTimestamp && parseInt(existingTimestamp, 10) === current15MinTimestamp) {
-                    continue;
+                const targetTimestamp = slug.match(/updown-15m-(\d+)/)?.[1];
+                if (existingTimestamp === targetTimestamp) {
+                    this.discoveredSlugs.add(slug);
+                    return null;
                 }
             }
 
             try {
-                // Fetch market data from Gamma API
                 const url = `https://gamma-api.polymarket.com/events?slug=${slug}`;
                 const data = await fetchData(url).catch(() => null);
 
                 if (data && Array.isArray(data) && data.length > 0) {
-                    const event = data[0];
-                    const markets = event.markets || [];
-
-                    if (markets.length > 0) {
-                        const market = markets[0];
-                        const conditionId = market.conditionId;
-                        const clobTokenIds = market.clobTokenIds || [];
-
-                        // Parse end date
-                        let endDate: number | undefined;
-                        if (market.endDate) {
-                            endDate = typeof market.endDate === 'string'
-                                ? new Date(market.endDate).getTime()
-                                : market.endDate < 10000000000 ? market.endDate * 1000 : market.endDate;
-                        } else if (event.endDate) {
-                            endDate = typeof event.endDate === 'string'
-                                ? new Date(event.endDate).getTime()
-                                : event.endDate < 10000000000 ? event.endDate * 1000 : event.endDate;
-                        }
-
-                        // Fallback: calculate from slug
-                        if (!endDate) {
-                            endDate = current15MinStart + (15 * 60 * 1000);
-                        }
-
-                        // Get asset IDs
-                        let assetUp = clobTokenIds[0] || '';
-                        let assetDown = clobTokenIds[1] || '';
-
-                        // Check outcomes to determine correct order
-                        const outcomes = market.outcomes || [];
-                        if (outcomes.length >= 2) {
-                            const firstOutcome = (outcomes[0] || '').toLowerCase();
-                            if (firstOutcome === 'down' || firstOutcome === 'no') {
-                                // Swap - first token is DOWN
-                                [assetUp, assetDown] = [assetDown, assetUp];
-                            }
-                        }
-
-                        // Create or update market
-                        const marketName = market.question || event.title || slug;
-
-                        // Remove old market for this key before adding new one
-                        if (existingMarket) {
-                            this.markets.delete(marketKey);
-                        }
-
-                        // Add new market
-                        const newMarket: MarketStats = {
-                            marketKey,
-                            marketName,
-                            marketSlug: slug,
-                            sharesUp: 0,
-                            sharesDown: 0,
-                            investedUp: 0,
-                            investedDown: 0,
-                            totalCostUp: 0,
-                            totalCostDown: 0,
-                            tradesUp: 0,
-                            tradesDown: 0,
-                            lastUpdate: now,
-                            endDate,
-                            conditionId,
-                            assetUp,
-                            assetDown,
-                            marketOpenTime: now,
-                            category: marketKey,
-                        };
-
-                        this.markets.set(marketKey, newMarket);
-
-                        // Force display update
-                        this.lastDisplayTime = 0;
-                    }
+                    return { slug, data: data[0], marketKey, is15Min, isBTC };
                 }
-            } catch (error) {
-                // Silently ignore errors - market might not exist yet
+            } catch {
+                // Silently ignore
+            }
+            return null;
+        });
+
+        const results = await Promise.all(fetchPromises);
+
+        for (const result of results) {
+            if (!result) continue;
+
+            const { slug, data: event, marketKey, is15Min } = result;
+            const markets = event.markets || [];
+
+            if (markets.length === 0) continue;
+
+            const market = markets[0];
+            const conditionId = market.conditionId;
+            const clobTokenIds = market.clobTokenIds || [];
+
+            // Parse end date
+            let endDate: number | undefined;
+            if (market.endDate) {
+                endDate = typeof market.endDate === 'string'
+                    ? new Date(market.endDate).getTime()
+                    : market.endDate < 10000000000 ? market.endDate * 1000 : market.endDate;
+            } else if (event.endDate) {
+                endDate = typeof event.endDate === 'string'
+                    ? new Date(event.endDate).getTime()
+                    : event.endDate < 10000000000 ? event.endDate * 1000 : event.endDate;
+            }
+
+            // Fallback: calculate from slug
+            if (!endDate) {
+                if (is15Min) {
+                    const tsMatch = slug.match(/updown-15m-(\d+)/);
+                    if (tsMatch) {
+                        const startTime = parseInt(tsMatch[1], 10) * 1000;
+                        endDate = startTime + (15 * 60 * 1000);
+                    }
+                } else {
+                    // Hourly - 1 hour from now as fallback
+                    endDate = now + (60 * 60 * 1000);
+                }
+            }
+
+            // Skip if expired
+            if (endDate && endDate < now) continue;
+
+            // Get asset IDs
+            let assetUp = clobTokenIds[0] || '';
+            let assetDown = clobTokenIds[1] || '';
+
+            // Check outcomes to determine correct order
+            const outcomes = market.outcomes || [];
+            if (outcomes.length >= 2) {
+                const firstOutcome = (outcomes[0] || '').toLowerCase();
+                if (firstOutcome === 'down' || firstOutcome === 'no') {
+                    [assetUp, assetDown] = [assetDown, assetUp];
+                }
+            }
+
+            const marketName = market.question || event.title || slug;
+
+            // For 15-min markets, remove old window before adding new
+            if (is15Min) {
+                const existingMarket = this.markets.get(marketKey);
+                if (existingMarket && existingMarket.marketSlug !== slug) {
+                    // Old window - remove it
+                    this.markets.delete(marketKey);
+                }
+            }
+
+            // Add new market (or update if exists)
+            const existingMarket = this.markets.get(marketKey);
+            if (!existingMarket || existingMarket.marketSlug !== slug) {
+                const newMarket: MarketStats = {
+                    marketKey,
+                    marketName,
+                    marketSlug: slug,
+                    sharesUp: existingMarket?.sharesUp || 0,
+                    sharesDown: existingMarket?.sharesDown || 0,
+                    investedUp: existingMarket?.investedUp || 0,
+                    investedDown: existingMarket?.investedDown || 0,
+                    totalCostUp: existingMarket?.totalCostUp || 0,
+                    totalCostDown: existingMarket?.totalCostDown || 0,
+                    tradesUp: existingMarket?.tradesUp || 0,
+                    tradesDown: existingMarket?.tradesDown || 0,
+                    lastUpdate: now,
+                    endDate,
+                    conditionId,
+                    assetUp,
+                    assetDown,
+                    marketOpenTime: now,
+                    category: marketKey,
+                };
+
+                this.markets.set(marketKey, newMarket);
+                this.discoveredSlugs.add(slug);
+
+                // Force display update
+                this.lastDisplayTime = 0;
+            }
+        }
+
+        // Clean up old slugs from discoveredSlugs (prevent memory leak)
+        if (this.discoveredSlugs.size > 50) {
+            const oldSlugs = Array.from(this.discoveredSlugs).slice(0, 30);
+            for (const s of oldSlugs) {
+                this.discoveredSlugs.delete(s);
             }
         }
     }

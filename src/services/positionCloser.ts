@@ -194,12 +194,12 @@ export const closeMarketPositions = async (
     market: MarketStats
 ): Promise<void> => {
     if (!clobClient) {
-        Logger.info(`   ℹ️  No CLOB client available, skipping position close for ${market.marketKey}`);
+        // Silent return - no CLOB client is expected in watcher mode
         return;
     }
 
     if (ENV.TRACK_ONLY_MODE || !ENV.PROXY_WALLET) {
-        Logger.info(`   ℹ️  Track-only mode or no proxy wallet, skipping position close for ${market.marketKey}`);
+        // Silent return - track-only mode or no proxy wallet is expected
         return;
     }
 

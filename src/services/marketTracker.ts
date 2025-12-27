@@ -1613,10 +1613,14 @@ class MarketTracker {
                     chalk.gray('  No active markets to display'),
                     ''
                 ];
-                // Clear screen, scrollback buffer, and move cursor to top (prevents terminal history)
-                // \x1b[3J = clear screen and scrollback buffer, \x1b[H = move cursor to top-left
-                process.stdout.write('\x1b[3J\x1b[H');
-                process.stdout.write(emptyStateLines.join('\n') + '\n');
+                // Clear screen completely and move cursor to top
+                process.stdout.write('\x1b[2J\x1b[3J\x1b[H');
+                const paddedEmpty1 = emptyStateLines.map(line => {
+                    const visualLength = line.replace(/\x1b\[[0-9;]*m/g, '').length;
+                    return line + ' '.repeat(Math.max(0, 82 - visualLength));
+                });
+                process.stdout.write(paddedEmpty1.join('\n'));
+                process.stdout.write('\n\x1b[0J');
             }
             return; // Lock will be released in finally block
         }
@@ -1687,10 +1691,14 @@ class MarketTracker {
                     chalk.gray('  No active markets to display'),
                     ''
                 ];
-                // Clear screen, scrollback buffer, and move cursor to top (prevents terminal history)
-                // \x1b[3J = clear screen and scrollback buffer, \x1b[H = move cursor to top-left
-                process.stdout.write('\x1b[3J\x1b[H');
-                process.stdout.write(emptyStateLines.join('\n') + '\n');
+                // Clear screen completely and move cursor to top
+                process.stdout.write('\x1b[2J\x1b[3J\x1b[H');
+                const paddedEmpty2 = emptyStateLines.map(line => {
+                    const visualLength = line.replace(/\x1b\[[0-9;]*m/g, '').length;
+                    return line + ' '.repeat(Math.max(0, 82 - visualLength));
+                });
+                process.stdout.write(paddedEmpty2.join('\n'));
+                process.stdout.write('\n\x1b[0J');
             }
             return; // Lock will be released in finally block
         }
@@ -1776,8 +1784,37 @@ class MarketTracker {
             modeHeader = '📊 TRADING MODE';
         }
         
+        // Calculate overall PnL for header display (before building rest of output)
+        let headerTotalCostBasis = 0;
+        let headerTotalValue = 0;
+        for (const market of sortedMarkets) {
+            const marketCostBasis = market.totalCostUp + market.totalCostDown;
+            headerTotalCostBasis += marketCostBasis;
+            // Calculate current value
+            let marketValue = 0;
+            if (market.currentPriceUp && market.sharesUp > 0) {
+                marketValue += market.sharesUp * market.currentPriceUp;
+            }
+            if (market.currentPriceDown && market.sharesDown > 0) {
+                marketValue += market.sharesDown * market.currentPriceDown;
+            }
+            headerTotalValue += marketValue;
+        }
+        const headerTotalPnl = headerTotalValue - headerTotalCostBasis;
+        const headerPnlPercent = headerTotalCostBasis > 0 ? ((headerTotalPnl / headerTotalCostBasis) * 100).toFixed(1) : '0.0';
+        const headerPnlSign = headerTotalPnl >= 0 ? '+' : '';
+        const headerPnlColor = headerTotalPnl >= 0 ? chalk.green : chalk.red;
+        
         outputLines.push(chalk.cyan('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
-        outputLines.push(chalk.cyan.bold(`  ${modeHeader} - TRADER MARKET TRACKING`));
+        // Build header with PnL - ensure proper formatting
+        if (headerTotalCostBasis > 0) {
+            const pnlValue = `${headerPnlSign}$${headerTotalPnl.toFixed(2)}`;
+            const pnlPercent = `(${headerPnlSign}${headerPnlPercent}%)`;
+            const headerPnlStr = ` PnL: ` + headerPnlColor(pnlValue + ' ' + pnlPercent);
+            outputLines.push(chalk.cyan.bold(`  ${modeHeader} - TRADER MARKET TRACKING`) + headerPnlStr);
+        } else {
+            outputLines.push(chalk.cyan.bold(`  ${modeHeader} - TRADER MARKET TRACKING`));
+        }
         
         if (this.displayMode === 'PAPER') {
             // Paper mode header - show paper trading info
@@ -1922,6 +1959,7 @@ class MarketTracker {
                 }
             }
 
+            // Ensure clean formatting - no extra characters
             outputLines.push(chalk.yellow(`┌─ ${market.marketKey} ${timeLeftStr}`));
             outputLines.push(chalk.gray(`│  ${marketNameDisplay}`));
             
@@ -1941,6 +1979,7 @@ class MarketTracker {
             if (hasValidPriceUp && hasValidPriceDown) {
                 const liveSum = market.currentPriceUp! + market.currentPriceDown!;
                 const sumStatus = Math.abs(liveSum - 1.0) < 0.02 ? chalk.green('✓') : chalk.yellow('⚠️');
+                // Ensure clean line - no extra content
                 outputLines.push(chalk.gray(`│  💵 Live Prices: UP $${market.currentPriceUp!.toFixed(4)} + DOWN $${market.currentPriceDown!.toFixed(4)} = $${liveSum.toFixed(4)} `) + sumStatus);
             }
 
@@ -2028,7 +2067,11 @@ class MarketTracker {
         };
 
         const currentWindowStr = `${formatTimeUpcoming(upcomingHour, current15MinWindow)}-${formatTimeUpcoming(nextWindowHour, next15MinWindow)}`;
-        const nextHourStr = upcomingHour < 12 ? `${upcomingHour + 1}AM` : upcomingHour === 11 ? '12PM' : upcomingHour === 23 ? '12AM' : `${upcomingHour - 11}PM`;
+        // Fix hour formatting for next hour display
+        let nextHourDisplay = (upcomingHour + 1) % 24;
+        const nextHourAmPm = nextHourDisplay >= 12 ? 'PM' : 'AM';
+        const nextHour12 = nextHourDisplay === 0 ? 12 : nextHourDisplay > 12 ? nextHourDisplay - 12 : nextHourDisplay;
+        const nextHourStr = `${nextHour12}${nextHourAmPm} ET`;
 
         // Check what markets we have discovered
         const hasBTC15m = Array.from(this.markets.values()).some(m => m.marketKey === 'BTC-UpDown-15' && m.endDate && m.endDate > now);
@@ -2051,7 +2094,7 @@ class MarketTracker {
         // 1h status
         const btc1hStatus = hasBTC1h ? chalk.green('✓ READY') : chalk.yellow('⏳ Waiting...');
         const eth1hStatus = hasETH1h ? chalk.green('✓ READY') : chalk.yellow('⏳ Waiting...');
-        outputLines.push(chalk.gray('    1-Hour: ') + chalk.cyan('BTC ') + btc1hStatus + chalk.gray(' | ') + chalk.cyan('ETH ') + eth1hStatus + chalk.gray(` | Next: ${nextHourStr} ET`));
+        outputLines.push(chalk.gray('    1-Hour: ') + chalk.cyan('BTC ') + btc1hStatus + chalk.gray(' | ') + chalk.cyan('ETH ') + eth1hStatus + chalk.gray(` | Next: ${nextHourStr}`));
 
         // Show tracked market slugs for debugging
         const slugs15m = Array.from(this.markets.values())
@@ -2070,11 +2113,25 @@ class MarketTracker {
         outputLines.push(chalk.cyan('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
         outputLines.push(''); // Empty line at end
 
-        // Clear screen, scrollback buffer, and move cursor to top (prevents terminal history)
-        // \x1b[3J = clear screen and scrollback buffer, \x1b[H = move cursor to top-left
-        process.stdout.write('\x1b[3J\x1b[H');
-        const output = outputLines.join('\n');
-        process.stdout.write(output + '\n');
+        // Clear screen completely and move cursor to top
+        // \x1b[2J = clear entire screen, \x1b[3J = clear scrollback, \x1b[H = move cursor to top-left
+        process.stdout.write('\x1b[2J\x1b[3J\x1b[H');
+
+        // Pad each line to 82 chars to prevent overlap from previous longer lines
+        const paddedLines = outputLines.map(line => {
+            // Strip ANSI codes to get visual length
+            const visualLength = line.replace(/\x1b\[[0-9;]*m/g, '').length;
+            const padding = Math.max(0, 82 - visualLength);
+            return line + ' '.repeat(padding);
+        });
+
+        // Build output string and write in one go to prevent corruption
+        const output = paddedLines.join('\n');
+        process.stdout.write(output);
+        process.stdout.write('\n'); // Final newline
+
+        // Clear any remaining lines below (in case previous output was longer)
+        process.stdout.write('\x1b[0J');
         } finally {
             // Release lock
             this.isDisplaying = false;
@@ -2385,7 +2442,20 @@ class MarketTracker {
 
             const market = markets[0];
             const conditionId = market.conditionId;
-            const clobTokenIds = market.clobTokenIds || [];
+
+            // Parse clobTokenIds - API returns it as JSON string, not array
+            let clobTokenIds: string[] = [];
+            if (typeof market.clobTokenIds === 'string') {
+                try {
+                    clobTokenIds = JSON.parse(market.clobTokenIds);
+                } catch {
+                    clobTokenIds = [];
+                }
+            } else if (Array.isArray(market.clobTokenIds)) {
+                clobTokenIds = market.clobTokenIds;
+            }
+
+            if (clobTokenIds.length < 2) continue;
 
             // Parse end date - ALWAYS calculate from slug for 15-min markets (API endDate is unreliable)
             let endDate: number | undefined;
@@ -2445,8 +2515,19 @@ class MarketTracker {
             let assetUp = clobTokenIds[0] || '';
             let assetDown = clobTokenIds[1] || '';
 
+            // Parse outcomes - API returns it as JSON string, not array
+            let outcomes: string[] = [];
+            if (typeof market.outcomes === 'string') {
+                try {
+                    outcomes = JSON.parse(market.outcomes);
+                } catch {
+                    outcomes = [];
+                }
+            } else if (Array.isArray(market.outcomes)) {
+                outcomes = market.outcomes;
+            }
+
             // Check outcomes to determine correct order
-            const outcomes = market.outcomes || [];
             if (outcomes.length >= 2) {
                 const firstOutcome = (outcomes[0] || '').toLowerCase();
                 if (firstOutcome === 'down' || firstOutcome === 'no') {

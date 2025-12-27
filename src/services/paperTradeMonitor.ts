@@ -432,7 +432,7 @@ async function proactivelyDiscoverMarkets(): Promise<void> {
         fetchedSlugs.clear();
         lastProcessedWindow = currentWindowStart;
         lastHourProcessed = currentHourET;
-        Logger.info(`🔄 New ${windowChanged ? '15-min window' : 'hour'} detected! Scanning for new markets...`);
+        debugLog(`🔄 New ${windowChanged ? '15-min window' : 'hour'} detected! Scanning for new markets...`);
 
         // =======================================================================
         // NOTE: We do NOT delete buildStates here - they need to remain visible
@@ -581,15 +581,10 @@ async function proactivelyDiscoverMarkets(): Promise<void> {
 
     // Fetch markets in parallel for speed
     const fetchPromises = slugsToCheck.map(async (slug) => {
-        // Skip if already fetched in this session
-        if (fetchedSlugs.has(slug)) {
-            return;
-        }
-
         // Check if we already have this market by slug
         let alreadyHave = false;
         for (const [_, market] of discoveredMarkets.entries()) {
-            if (market.marketSlug === slug) {
+            if (market.marketSlug === slug && market.endDate && market.endDate > now) {
                 alreadyHave = true;
                 break;
             }
@@ -598,13 +593,23 @@ async function proactivelyDiscoverMarkets(): Promise<void> {
             return;
         }
 
-        Logger.info(`   📡 Fetching: ${slug}`);
+        // Skip if fetched recently (within last 5 seconds) to avoid API spam
+        // BUT always retry if it's a current window market we don't have
+        const isCurrent15m = slug === btcSlugCurrent || slug === ethSlugCurrent;
+        const isCurrent1h = slug === btcHourlyCurrent || slug === ethHourlyCurrent;
+        const isCurrentMarket = isCurrent15m || isCurrent1h;
+
+        if (fetchedSlugs.has(slug) && !isCurrentMarket) {
+            return;
+        }
+
+        debugLog(`   📡 Fetching: ${slug}${isCurrentMarket ? ' (CURRENT - priority)' : ''}`);
 
         // DON'T mark as fetched until AFTER success - allows retry on failure
         try {
             const url = `https://gamma-api.polymarket.com/events?slug=${slug}`;
             const data = await fetchData(url).catch((e) => {
-                Logger.error(`   ❌ Fetch failed for ${slug}: ${e}`);
+                debugLog(`   ❌ Fetch failed for ${slug}: ${e}`);
                 return null;
             });
 
@@ -741,7 +746,7 @@ async function proactivelyDiscoverMarkets(): Promise<void> {
 
                     const timeLeftMin = endDate ? Math.floor((endDate - now) / 60000) : 0;
                     debugLog(`🎯 PROACTIVE DISCOVERY: ${marketKey} | ${slug} | ${timeLeftMin}m left | assets: UP=${assetUp?.slice(0,8)}..., DOWN=${assetDown?.slice(0,8)}...`);
-                    Logger.success(`🎯 PROACTIVE: Found ${marketKey} | ${timeLeftMin}m remaining`);
+                    debugLog(`🎯 PROACTIVE: Found ${marketKey} | ${timeLeftMin}m remaining`);
                 }
             }
         } catch (e) {
@@ -752,6 +757,105 @@ async function proactivelyDiscoverMarkets(): Promise<void> {
 
     // Wait for all fetches to complete (parallel for speed)
     await Promise.all(fetchPromises);
+
+    // ==========================================================================
+    // FALLBACK: If still missing current 15-min markets after slug lookup,
+    // try search API which might find them before slug is fully indexed
+    // ==========================================================================
+    const stillMissingBTC15m = !Array.from(discoveredMarkets.values()).some(m =>
+        m.marketKey === 'BTC-UpDown-15' && m.endDate && m.endDate > now
+    );
+    const stillMissingETH15m = !Array.from(discoveredMarkets.values()).some(m =>
+        m.marketKey === 'ETH-UpDown-15' && m.endDate && m.endDate > now
+    );
+
+    if (stillMissingBTC15m || stillMissingETH15m) {
+        debugLog(`🔄 FALLBACK: Using search API (BTC missing: ${stillMissingBTC15m}, ETH missing: ${stillMissingETH15m})`);
+
+        try {
+            // Search for recent 15-min markets
+            const searchUrl = 'https://gamma-api.polymarket.com/events?tag=crypto&limit=20&active=true';
+            const searchData = await fetchData(searchUrl).catch(() => null);
+
+            if (searchData && Array.isArray(searchData)) {
+                for (const event of searchData) {
+                    const title = (event.title || '').toLowerCase();
+                    const slug = event.slug || '';
+
+                    // Check if this is a 15-min BTC or ETH market we need
+                    const isBTC15m = (title.includes('bitcoin') || title.includes('btc')) &&
+                                     slug.includes('updown-15m');
+                    const isETH15m = (title.includes('ethereum') || title.includes('eth')) &&
+                                     slug.includes('updown-15m');
+
+                    if ((stillMissingBTC15m && isBTC15m) || (stillMissingETH15m && isETH15m)) {
+                        const markets = event.markets || [];
+                        if (markets.length === 0) continue;
+
+                        const market = markets[0];
+                        const conditionId = market.conditionId || market.condition_id;
+
+                        // Skip if already discovered
+                        if (discoveredMarkets.has(conditionId)) continue;
+
+                        // Parse clobTokenIds
+                        let clobTokenIds: string[] = [];
+                        if (typeof market.clobTokenIds === 'string') {
+                            try { clobTokenIds = JSON.parse(market.clobTokenIds); } catch { continue; }
+                        } else if (Array.isArray(market.clobTokenIds)) {
+                            clobTokenIds = market.clobTokenIds;
+                        }
+                        if (!conditionId || clobTokenIds.length < 2) continue;
+
+                        // Parse outcomes
+                        let outcomes: string[] = ['Up', 'Down'];
+                        if (typeof market.outcomes === 'string') {
+                            try { outcomes = JSON.parse(market.outcomes); } catch { /* use default */ }
+                        } else if (Array.isArray(market.outcomes)) {
+                            outcomes = market.outcomes;
+                        }
+                        const isFirstUp = outcomes[0]?.toLowerCase().includes('up');
+                        const assetUp = isFirstUp ? clobTokenIds[0] : clobTokenIds[1];
+                        const assetDown = isFirstUp ? clobTokenIds[1] : clobTokenIds[0];
+
+                        // Calculate endDate from slug
+                        let endDate = 0;
+                        const timestamp15Match = slug.match(/updown-15m-(\d+)/);
+                        if (timestamp15Match) {
+                            const startTime = parseInt(timestamp15Match[1], 10) * 1000;
+                            endDate = startTime + (15 * 60 * 1000);
+                        }
+
+                        // Skip if expired
+                        if (endDate && endDate < now) continue;
+
+                        const marketKey = isBTC15m ? 'BTC-UpDown-15' : 'ETH-UpDown-15';
+                        const newMarket = {
+                            conditionId,
+                            marketKey,
+                            marketName: event.title || slug,
+                            marketSlug: slug,
+                            assetUp,
+                            assetDown,
+                            endDate,
+                            priceUp: 0.5,
+                            priceDown: 0.5,
+                            lastUpdate: now,
+                        };
+
+                        discoveredMarkets.set(conditionId, newMarket);
+                        proactivelyDiscoveredIds.add(conditionId);
+                        marketTracker.ensureMarketWithAssets(marketKey, event.title, slug, conditionId, assetUp, assetDown, endDate);
+
+                        const timeLeftMin = endDate ? Math.floor((endDate - now) / 60000) : 0;
+                        debugLog(`🎯 FALLBACK FOUND: ${marketKey} | ${slug} | ${timeLeftMin}m left`);
+                    }
+                }
+            }
+        } catch (e) {
+            debugLog(`Fallback search failed: ${e}`);
+        }
+    }
 
     // Note: Cache is now cleared at the start of each new 15-minute window
     // This ensures instant discovery of new markets
@@ -989,7 +1093,7 @@ async function discoverMarketsFromWatchers(): Promise<void> {
             debugLog(`   ID: ${id}, assetUp: ${newMarket.assetUp || 'none'}, assetDown: ${newMarket.assetDown || 'none'}, endDate: ${newMarket.endDate ? new Date(newMarket.endDate).toISOString() : 'none'}`);
 
             // Log prominently when we find a new market
-            Logger.success(`🎯 NEW MARKET DISCOVERED: ${market.marketKey} | ${timeLeftMin}m remaining | UP:${newMarket.assetUp ? '✓' : '✗'} DOWN:${newMarket.assetDown ? '✓' : '✗'}`);
+            debugLog(`🎯 NEW MARKET DISCOVERED: ${market.marketKey} | ${timeLeftMin}m remaining | UP:${newMarket.assetUp ? '✓' : '✗'} DOWN:${newMarket.assetDown ? '✓' : '✗'}`);
         }
     }
 
@@ -1296,7 +1400,7 @@ async function buildPositionIncrementally(market: typeof discoveredMarkets exten
         buildingPositions.set(positionKey, buildState);
 
         debugLog(`buildPosition: STARTED building ${market.marketKey} - target UP: $${buildState.targetUp.toFixed(2)}, DOWN: $${buildState.targetDown.toFixed(2)}`);
-        Logger.info(`📈 Building position: ${market.marketKey} | Target: UP $${buildState.targetUp.toFixed(2)} / DOWN $${buildState.targetDown.toFixed(2)}`);
+        debugLog(`📈 Building position: ${market.marketKey} | Target: UP $${buildState.targetUp.toFixed(2)} / DOWN $${buildState.targetDown.toFixed(2)}`);
     }
 
     // ==========================================================================
@@ -1644,7 +1748,7 @@ async function finalizePosition(market: typeof discoveredMarkets extends Map<str
     const downPct = (buildState.investedDown / totalInvested * 100).toFixed(1);
 
     debugLog(`finalizePosition: ${market.marketKey} - ${buildState.tradeCount} trades, avgUp: ${buildState.avgPriceUp.toFixed(4)}, avgDown: ${buildState.avgPriceDown.toFixed(4)}`);
-    Logger.success(`📊 POSITION BUILT: ${market.marketKey} | ${buildState.tradeCount} trades | UP $${buildState.investedUp.toFixed(2)} @ avg ${buildState.avgPriceUp.toFixed(4)} / DOWN $${buildState.investedDown.toFixed(2)} @ avg ${buildState.avgPriceDown.toFixed(4)} (${upPct}/${downPct})`);
+    debugLog(`📊 POSITION BUILT: ${market.marketKey} | ${buildState.tradeCount} trades | UP $${buildState.investedUp.toFixed(2)} @ avg ${buildState.avgPriceUp.toFixed(4)} / DOWN $${buildState.investedDown.toFixed(2)} @ avg ${buildState.avgPriceDown.toFixed(4)} (${upPct}/${downPct})`);
 
     // Clean up build state
     buildingPositions.delete(positionKey);
@@ -1717,12 +1821,16 @@ async function executeArbitrageTrade(position: MarketPosition, market: typeof di
     const loserSide = winner === 'UP' ? 'DOWN' : 'UP';
     await logPaperTrade(position, loserSide, 'BUY', arbShares, arbCost, loserPrice);
 
-    Logger.success(`🎯 ARB: ${position.marketKey} | Bought ${loserSide} @ $${loserPrice.toFixed(4)} (${arbShares.toFixed(0)} shares for $${arbCost.toFixed(2)}) | Winner: ${winner} (${((winner === 'UP' ? priceUp : priceDown) * 100).toFixed(1)}%)`);
+    debugLog(`🎯 ARB: ${position.marketKey} | Bought ${loserSide} @ $${loserPrice.toFixed(4)} (${arbShares.toFixed(0)} shares for $${arbCost.toFixed(2)}) | Winner: ${winner} (${((winner === 'UP' ? priceUp : priceDown) * 100).toFixed(1)}%)`);
 }
 
 /**
  * Settle expired positions
+ * Wait for clear winner (one side >= 95%) before settling
+ * Timeout after 2 minutes and use higher price as winner
  */
+const SETTLEMENT_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes after endDate
+
 async function settlePositions(): Promise<void> {
     const now = Date.now();
 
@@ -1747,9 +1855,28 @@ async function settlePositions(): Promise<void> {
             if (fetchedDown !== null) priceDown = fetchedDown;
         }
 
-        // Determine winner
-        const upWon = priceUp >= 0.95;
-        const downWon = priceDown >= 0.95;
+        // Determine winner - need one side to reach 95%+
+        let upWon = priceUp >= 0.95;
+        let downWon = priceDown >= 0.95;
+
+        // If no clear winner yet, wait or use fallback
+        if (!upWon && !downWon) {
+            const timeSinceEnd = now - position.endDate;
+
+            if (timeSinceEnd < SETTLEMENT_TIMEOUT_MS) {
+                // Still within timeout window - keep waiting for clear winner
+                debugLog(`⏳ Waiting for clear winner: ${position.marketKey} | UP: ${(priceUp * 100).toFixed(1)}% | DOWN: ${(priceDown * 100).toFixed(1)}% | Time since end: ${Math.floor(timeSinceEnd / 1000)}s`);
+                continue; // Don't settle yet
+            }
+
+            // Timeout reached - use higher price as winner
+            debugLog(`⚠️ Settlement timeout: ${position.marketKey} - using higher price as winner`);
+            if (priceUp > priceDown) {
+                upWon = true;
+            } else {
+                downWon = true;
+            }
+        }
 
         await settlePosition(position, upWon, downWon);
     }
@@ -2340,10 +2467,23 @@ function displayStatus(): void {
     lines.push(chalk.cyan('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
     lines.push('');
 
-    // Clear screen, scrollback buffer, and move cursor to top (prevents terminal history)
-    // \x1b[3J = clear screen and scrollback buffer, \x1b[H = move cursor to top-left
-    process.stdout.write('\x1b[3J\x1b[H');
-    process.stdout.write(lines.join('\n') + '\n');
+    // Clear screen completely and move cursor to top
+    // \x1b[2J = clear entire screen, \x1b[3J = clear scrollback, \x1b[H = move cursor to top-left
+    // \x1b[0J = clear from cursor to end of screen (prevents leftover text)
+    process.stdout.write('\x1b[2J\x1b[3J\x1b[H');
+
+    // Pad each line to 82 chars to prevent overlap from previous longer lines
+    const paddedLines = lines.map(line => {
+        // Strip ANSI codes to get visual length
+        const visualLength = line.replace(/\x1b\[[0-9;]*m/g, '').length;
+        const padding = Math.max(0, 82 - visualLength);
+        return line + ' '.repeat(padding);
+    });
+
+    process.stdout.write(paddedLines.join('\n') + '\n');
+
+    // Clear any remaining lines below (in case previous output was longer)
+    process.stdout.write('\x1b[0J');
 }
 
 /**

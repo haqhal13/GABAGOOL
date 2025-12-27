@@ -614,13 +614,15 @@ async function proactivelyDiscoverMarkets(): Promise<void> {
             });
 
             if (data && Array.isArray(data) && data.length > 0) {
-                // Mark as fetched ONLY on success
-                fetchedSlugs.add(slug);
                 const event = data[0];
 
                 // Extract market data from nested structure
                 const markets = event.markets || [];
-                if (markets.length === 0) return;
+                if (markets.length === 0) {
+                    // Don't mark as fetched if no markets - allow retry
+                    debugLog(`   ⚠️ No markets in event for ${slug}`);
+                    return;
+                }
 
                 const market = markets[0];
                 const conditionId = market.conditionId || market.condition_id;
@@ -740,6 +742,9 @@ async function proactivelyDiscoverMarkets(): Promise<void> {
 
                     discoveredMarkets.set(conditionId, newMarket);
                     proactivelyDiscoveredIds.add(conditionId);
+
+                    // Mark as fetched ONLY after successful discovery
+                    fetchedSlugs.add(slug);
 
                     // CRITICAL: Ensure market exists in marketTracker with both assets for live price fetching
                     marketTracker.ensureMarketWithAssets(marketKey, title, slug, conditionId, assetUp, assetDown, endDate);

@@ -306,20 +306,32 @@ class TradeLogger {
         }
 
         try {
-            // Fetch market prices at time of trade
-            const prices = await this.fetchMarketPrices(activity.conditionId);
-            
             const isUp = this.isUpOutcome(activity);
             const outcome = isUp ? 'UP' : 'DOWN';
-            
+            const tradePrice = parseFloat(activity.price || '0');
+
+            // For PAPER trades, use the actual trade price that was passed in
+            // For WATCH trades, fetch current market prices from API
+            let prices: { priceUp: number; priceDown: number };
+            if (traderAddress === 'PAPER') {
+                // PAPER trades already have the exact price - use it directly
+                // Calculate complementary price (UP + DOWN = 1.0)
+                if (isUp) {
+                    prices = { priceUp: tradePrice, priceDown: 1.0 - tradePrice };
+                } else {
+                    prices = { priceUp: 1.0 - tradePrice, priceDown: tradePrice };
+                }
+            } else {
+                // WATCH trades - fetch current market prices
+                prices = await this.fetchMarketPrices(activity.conditionId);
+            }
+
             // Extract market key (similar to marketTracker logic)
             const marketKey = this.extractMarketKey(activity);
-            
+
             const timestamp = activity.timestamp ? activity.timestamp * 1000 : Date.now();
             const date = new Date(timestamp).toISOString();
             const timeBreakdown = getTimestampBreakdown(timestamp);
-            
-            const tradePrice = parseFloat(activity.price || '0');
             const size = parseFloat(activity.size || '0');
             const usdcSize = parseFloat(activity.usdcSize || '0');
             

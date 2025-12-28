@@ -41,31 +41,33 @@ function debugLog(message: string): void {
 // =============================================================================
 const PAPER_STARTING_CAPITAL = parseFloat(process.env.PAPER_STARTING_CAPITAL || '10000');
 
-// Per-market allocation (from watcher: avg $2,378 per market, median $2,036)
-// BTC gets more capital (28k trades vs 12k ETH trades)
-const PAPER_BTC_MAX_PER_MARKET = parseFloat(process.env.PAPER_BTC_MAX_PER_MARKET || '2400');
-const PAPER_ETH_MAX_PER_MARKET = parseFloat(process.env.PAPER_ETH_MAX_PER_MARKET || '1800');
+// Per-market allocation (from 57,259 trades: Max $6,793, Avg $3,610 per BTC 15m window)
+// BTC gets more capital (67.3% BTC vs 32.7% ETH)
+const PAPER_BTC_MAX_PER_MARKET = parseFloat(process.env.PAPER_BTC_MAX_PER_MARKET || '3600');
+const PAPER_ETH_MAX_PER_MARKET = parseFloat(process.env.PAPER_ETH_MAX_PER_MARKET || '2400');
 
 // =============================================================================
-// THE SECRET SAUCE: EXACT WATCHER SHARE DISTRIBUTIONS (Dec 27 - 35,075 trades!)
-// KEY INSIGHT: 22 shares is #1 for BTC at 14.2%! Paper was missing this entirely!
-// BTC 15m: 22(14.2%), 5(9.6%), 2(7.7%), 1(6.7%), 3(5.3%)
-// ETH 15m: 12(26.6%!), 11(8.5%), 16(8.2%), 5(7.4%), 9(5.9%)
+// THE SECRET SAUCE: EXACT WATCHER SHARE DISTRIBUTIONS (Dec 27-28 - 57,259 trades!)
+// KEY INSIGHT: 22 shares is #1 for BTC at 18.8%! ETH 12 shares at 40.9%!
+// BTC 15m: 22(18.8%), 5(12.5%), 1(6.8%), 2(6.7%), 21(5.5%)
+// ETH 15m: 12(40.9%!), 11(10.7%), 10(8.1%), 8(6.0%), 5(5.8%)
 // =============================================================================
-// BTC 15-min share distribution (19,652 trades analyzed)
-const BTC_15M_SHARE_AMOUNTS = [22, 5, 2, 1, 3, 28, 10, 20, 21, 4, 6, 7, 16, 17, 19];
-const BTC_15M_SHARE_WEIGHTS = [14.2, 9.6, 7.7, 6.7, 5.3, 4.6, 4.1, 3.9, 3.8, 3.4, 3.3, 2.9, 2.9, 2.7, 2.7];
+// BTC 15-min share distribution (32,166 trades analyzed - Dec 27-28)
+// 22 shares dominates at 18.8%, followed by 5 shares at 12.5%
+const BTC_15M_SHARE_AMOUNTS = [22, 5, 1, 2, 21, 20, 10, 3, 6, 19, 4, 7, 8, 16, 17];
+const BTC_15M_SHARE_WEIGHTS = [18.8, 12.5, 6.8, 6.7, 5.5, 4.6, 4.3, 3.9, 3.8, 3.1, 3.0, 2.8, 2.7, 2.7, 2.5];
 
-// ETH 15-min share distribution (8,729 trades analyzed) - 12 shares is #1!
-const ETH_15M_SHARE_AMOUNTS = [12, 11, 16, 5, 9, 2, 10, 3, 8, 7, 6, 1, 4, 15, 13];
-const ETH_15M_SHARE_WEIGHTS = [26.6, 8.5, 8.2, 7.4, 5.9, 5.8, 5.7, 5.3, 5.1, 4.2, 3.7, 3.7, 3.5, 2.3, 1.5];
+// ETH 15-min share distribution (13,530 trades analyzed) - 12 shares DOMINATES at 40.9%!
+const ETH_15M_SHARE_AMOUNTS = [12, 11, 10, 8, 5, 9, 2, 7, 6, 1, 3, 4];
+const ETH_15M_SHARE_WEIGHTS = [40.9, 10.7, 8.1, 6.0, 5.8, 5.3, 4.8, 4.5, 4.2, 3.4, 2.9, 2.6];
 
-// 1-hour market share distribution (BTC 3,769 trades, ETH 2,925 trades)
-const BTC_1H_SHARE_AMOUNTS = [22, 5, 2, 10, 6, 3, 1, 4, 12, 11];
-const BTC_1H_SHARE_WEIGHTS = [15.0, 12.0, 10.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.5, 3.0];
+// 1-hour market share distribution (BTC 6,354 trades, ETH 5,209 trades)
+// BTC 1h: 16 shares dominates at 24%, ETH 1h: 10 shares dominates at 41.4%
+const BTC_1H_SHARE_AMOUNTS = [16, 15, 5, 12, 10, 14, 9, 11, 2, 1];
+const BTC_1H_SHARE_WEIGHTS = [24.0, 9.5, 8.7, 6.9, 6.5, 6.3, 4.7, 4.2, 4.2, 3.7];
 
-const ETH_1H_SHARE_AMOUNTS = [12, 11, 5, 2, 9, 10, 3, 8, 6, 7];
-const ETH_1H_SHARE_WEIGHTS = [20.0, 10.0, 9.0, 8.0, 7.0, 6.0, 5.5, 5.0, 4.5, 4.0];
+const ETH_1H_SHARE_AMOUNTS = [10, 9, 5, 7, 6, 8, 1, 2, 3];
+const ETH_1H_SHARE_WEIGHTS = [41.4, 16.5, 7.4, 7.0, 5.3, 5.1, 4.3, 4.3, 3.5];
 
 // Legacy fallback
 const TARGET_SHARE_AMOUNTS = BTC_15M_SHARE_AMOUNTS;
@@ -73,23 +75,23 @@ const SHARE_WEIGHTS = BTC_15M_SHARE_WEIGHTS;
 const MIN_SHARES = 0.5;
 
 // =============================================================================
-// TIMING PATTERNS (from Dec 27 - 35,075 trades analysis)
-// CRITICAL: Paper was at 1-2s gaps but watcher is at 2-3s gaps (79.8%!)
-// Gap distribution: 79.8% at 2-3s, 11.0% at 4-5s, 6.1% at 5-10s
-// Average gap: 3.00s, Median gap: 2.00s
-// Trade rate: 78.1 trades/minute average
+// TIMING PATTERNS (from Dec 27-28 - 57,259 trades analysis)
+// CRITICAL: 72.6% at 2-3s, 13.7% at 4-5s, 8.5% at 5-10s
+// Average gap: 3.56s, Median gap: 2.00s
+// No trades in 0-1s, 1-2s, or 3-4s buckets - watcher uses discrete intervals
 // =============================================================================
 const BATCH_INTERVAL_MS = 2500; // Increased from 2000ms
 const BASE_GAP_MS = 2500; // Base gap between trades
-const POLL_INTERVAL_MS = 300; // Poll interval
+const POLL_INTERVAL_MS = 50; // Poll interval - maximum speed (20/sec)
 
-// Direction balance: 49.7% UP, 50.3% DOWN - true 50/50
-const UP_BIAS = 0.497; // Match exact watcher ratio
+// Direction balance: ~50/50 - BTC: 50.9% UP, ETH: 49.9% UP (from 57,259 trades)
+const BTC_UP_BIAS = 0.509; // BTC slightly favors UP
+const ETH_UP_BIAS = 0.499; // ETH is truly 50/50
+const UP_BIAS = 0.504; // Overall average
 const DIRECTION_VARIANCE = 0.01;
 
-// BTC vs ETH allocation: 66.8% BTC, 33.2% ETH (2:1 ratio from 35,075 trades)
-// Paper was at 51.3% BTC - need to increase!
-const BTC_ALLOCATION_RATIO = 0.668;
+// BTC vs ETH allocation: 67.3% BTC, 32.7% ETH (from 57,259 trades)
+const BTC_ALLOCATION_RATIO = 0.673;
 
 // =============================================================================
 // MOMENTUM CHASING - ANALYSIS SHOWS NO MOMENTUM BIAS!
@@ -1228,8 +1230,8 @@ async function updatePrices(): Promise<void> {
     const marketsToUpdate = Array.from(discoveredMarkets.values())
         .filter(m => m.assetUp && m.assetDown && (!m.endDate || m.endDate > now));
 
-    // Update in parallel batches
-    const batchSize = 5;
+    // Update in parallel batches - larger batch for faster updates
+    const batchSize = 10;
     for (let i = 0; i < marketsToUpdate.length; i += batchSize) {
         const batch = marketsToUpdate.slice(i, i + batchSize);
         await Promise.all(batch.map(async (market) => {
@@ -1370,16 +1372,27 @@ async function buildPositionIncrementally(market: typeof discoveredMarkets exten
     if (!buildState) {
         // =======================================================================
         // POSITION INITIALIZATION - Matches watcher's per-market allocation
-        // Dec 27 DATA (35,075 trades):
-        // - BTC 15m: $118,957 across 19,652 trades = $6.05/trade
-        // - ETH 15m: $39,124 across 8,729 trades = $4.48/trade
-        // - BTC:ETH ratio = 66.8:33.2 = 2:1 preference for BTC
+        // Dec 27-28 DATA (57,259 trades):
+        // - 15m markets: 45,696 trades (79.8%) - HEAVY FOCUS!
+        // - 1h markets: 11,563 trades (20.2%)
+        // - BTC 15m: 32,166 (56.2%), ETH 15m: 13,530 (23.6%)
+        // - BTC 1h: 6,354 (11.1%), ETH 1h: 5,209 (9.1%)
         // =======================================================================
         const isBTC = market.marketKey.includes('BTC');
-        const maxPerMarket = isBTC ? PAPER_BTC_MAX_PER_MARKET : PAPER_ETH_MAX_PER_MARKET;
+        const is15m = market.marketKey.includes('15') || market.marketKey.includes('15m');
+        const is1h = market.marketKey.includes('1h') || market.marketKey.includes('1h-');
+
+        // Base max per market - higher for 15m, lower for 1h (watcher focuses 80% on 15m!)
+        let maxPerMarket: number;
+        if (is15m) {
+            maxPerMarket = isBTC ? PAPER_BTC_MAX_PER_MARKET : PAPER_ETH_MAX_PER_MARKET;
+        } else {
+            // 1h markets get 40% of 15m allocation (matches ~20% watcher focus)
+            maxPerMarket = (isBTC ? PAPER_BTC_MAX_PER_MARKET : PAPER_ETH_MAX_PER_MARKET) * 0.40;
+        }
 
         // Watcher invests 2x more in BTC than ETH
-        // BTC gets 70% of capital, ETH gets 50%
+        // BTC gets 75% of capital, ETH gets 50%
         const capitalRatio = isBTC ? 0.75 : 0.50;
         const positionSize = Math.min(maxPerMarket, currentCapital * capitalRatio);
 
@@ -1387,9 +1400,10 @@ async function buildPositionIncrementally(market: typeof discoveredMarkets exten
             return;
         }
 
-        // WATCHER PATTERN: 50.7% UP by $, 49.9% UP by trade count
+        // WATCHER PATTERN: BTC 50.9% UP, ETH 49.9% UP (from 57,259 trades)
         const sessionVariance = (Math.random() - 0.5) * 2 * DIRECTION_VARIANCE;
-        const upRatio = Math.max(0.49, Math.min(0.52, UP_BIAS + sessionVariance));
+        const baseUpBias = isBTC ? BTC_UP_BIAS : ETH_UP_BIAS;
+        const upRatio = Math.max(0.48, Math.min(0.52, baseUpBias + sessionVariance));
         const downRatio = 1 - upRatio;
 
         buildState = {
@@ -1632,15 +1646,51 @@ async function buildPositionIncrementally(market: typeof discoveredMarkets exten
         return;
     }
 
+    // ==========================================================================
+    // REALISTIC EXECUTION PRICES (from watcher analysis of 57,259 trades)
+    // Watcher trades at orderbook edge, NOT mid-market:
+    // - UP trades: avg +$0.054 above mid (pays premium for likely winner)
+    // - DOWN trades: avg -$0.082 below mid (gets discount on likely loser)
+    // This models realistic limit order execution or orderbook depth
+    // ==========================================================================
+
+    // Calculate execution prices based on watcher's actual execution patterns
+    // The spread varies based on how far price is from 50%
+    const priceDeviation = Math.abs(market.priceUp - 0.5); // 0 to 0.5
+
+    // UP execution: pay premium when UP is winning (priceUp > 0.5)
+    // The further from 50%, the more premium/discount
+    let execPriceUp = market.priceUp;
+    if (market.priceUp > 0.5) {
+        // UP is winning - pay premium (watcher pays +5.4% on average)
+        execPriceUp = Math.min(0.98, market.priceUp + (0.05 + priceDeviation * 0.1));
+    } else {
+        // UP is losing - get small discount
+        execPriceUp = Math.max(0.02, market.priceUp - 0.02);
+    }
+
+    // DOWN execution: get discount when DOWN is losing (priceDown < 0.5)
+    // Watcher gets -8.2% discount on average for DOWN
+    let execPriceDown = market.priceDown;
+    if (market.priceDown < 0.5) {
+        // DOWN is losing - get discount (watcher gets -8.2% on average)
+        execPriceDown = Math.max(0.02, market.priceDown - (0.08 + priceDeviation * 0.1));
+    } else {
+        // DOWN is winning - pay small premium
+        execPriceDown = Math.min(0.98, market.priceDown + 0.02);
+    }
+
     // Execute UP trade (minimum 0.5 shares like watcher)
     if (sharesUp >= MIN_SHARES && tradeUp > 0 && currentCapital >= tradeUp) {
+        // Recalculate trade value at execution price
+        const execTradeUp = sharesUp * execPriceUp;
 
-        // Update weighted average price
-        const totalInvestedUp = buildState.investedUp + tradeUp;
-        buildState.avgPriceUp = (buildState.avgPriceUp * buildState.investedUp + market.priceUp * tradeUp) / totalInvestedUp;
+        // Update weighted average price using execution price
+        const totalInvestedUp = buildState.investedUp + execTradeUp;
+        buildState.avgPriceUp = (buildState.avgPriceUp * buildState.investedUp + execPriceUp * execTradeUp) / totalInvestedUp;
 
         buildState.investedUp = totalInvestedUp;
-        currentCapital -= tradeUp;
+        currentCapital -= execTradeUp;
         buildState.tradeCount++;
         buildState.tradeCountUp++;  // Track UP trades separately
         totalTrades++;
@@ -1660,19 +1710,22 @@ async function buildPositionIncrementally(market: typeof discoveredMarkets exten
             hasSplitPosition: false, hasArbitragePosition: false, isSettled: false, settlementPnL: 0,
             createdAt: now,
         };
-        await logPaperTrade(tempPos, 'UP', 'BUY', sharesUp, tradeUp, market.priceUp);
+        await logPaperTrade(tempPos, 'UP', 'BUY', sharesUp, execTradeUp, execPriceUp);
 
-        debugLog(`buildPosition: ${market.marketKey} UP trade #${buildState.tradeCount}: ${sharesUp.toFixed(1)} shares @ ${market.priceUp.toFixed(4)} = $${tradeUp.toFixed(2)}`);
+        debugLog(`buildPosition: ${market.marketKey} UP trade #${buildState.tradeCount}: ${sharesUp.toFixed(1)} shares @ ${execPriceUp.toFixed(4)} = $${execTradeUp.toFixed(2)}`);
     }
 
     // Execute DOWN trade (minimum 0.5 shares like watcher)
     if (sharesDown >= MIN_SHARES && tradeDown > 0 && currentCapital >= tradeDown) {
-        // Update weighted average price
-        const totalInvestedDown = buildState.investedDown + tradeDown;
-        buildState.avgPriceDown = (buildState.avgPriceDown * buildState.investedDown + market.priceDown * tradeDown) / totalInvestedDown;
+        // Recalculate trade value at execution price
+        const execTradeDown = sharesDown * execPriceDown;
+
+        // Update weighted average price using execution price
+        const totalInvestedDown = buildState.investedDown + execTradeDown;
+        buildState.avgPriceDown = (buildState.avgPriceDown * buildState.investedDown + execPriceDown * execTradeDown) / totalInvestedDown;
 
         buildState.investedDown = totalInvestedDown;
-        currentCapital -= tradeDown;
+        currentCapital -= execTradeDown;
         buildState.tradeCount++;
         buildState.tradeCountDown++;  // Track DOWN trades separately
         totalTrades++;
@@ -1691,27 +1744,27 @@ async function buildPositionIncrementally(market: typeof discoveredMarkets exten
             hasSplitPosition: false, hasArbitragePosition: false, isSettled: false, settlementPnL: 0,
             createdAt: now,
         };
-        await logPaperTrade(tempPos, 'DOWN', 'BUY', sharesDown, tradeDown, market.priceDown);
+        await logPaperTrade(tempPos, 'DOWN', 'BUY', sharesDown, execTradeDown, execPriceDown);
 
-        debugLog(`buildPosition: ${market.marketKey} DOWN trade #${buildState.tradeCount}: ${sharesDown.toFixed(1)} shares @ ${market.priceDown.toFixed(4)} = $${tradeDown.toFixed(2)}`);
+        debugLog(`buildPosition: ${market.marketKey} DOWN trade #${buildState.tradeCount}: ${sharesDown.toFixed(1)} shares @ ${execPriceDown.toFixed(4)} = $${execTradeDown.toFixed(2)}`);
     }
 
     // Set next trade time based on EXACT watcher gap distribution
-    // Dec 27 - 35,075 trades: 79.8% at 2-3s, 11.0% at 4-5s, 6.1% at 5-10s, 2.2% at 10-20s
-    // Average: 3.00s, Median: 2.00s
-    // CRITICAL: Paper was trading at 1-2s (80.8%) - TOO FAST!
+    // Dec 27-28 - 57,259 trades: 72.6% at 2-3s, 13.7% at 4-5s, 8.5% at 5-10s
+    // Average: 3.56s, Median: 2.00s
+    // NOTE: No trades in 0-1s, 1-2s, or 3-4s - watcher uses discrete intervals
     const gapRoll = Math.random();
     let gap: number;
-    if (gapRoll < 0.798) {
-        gap = 2000 + Math.random() * 1000; // 2-3s (79.8% - EXACT watcher match)
-    } else if (gapRoll < 0.908) {
-        gap = 4000 + Math.random() * 1000; // 4-5s (11.0%)
-    } else if (gapRoll < 0.969) {
-        gap = 5000 + Math.random() * 5000; // 5-10s (6.1%)
-    } else if (gapRoll < 0.991) {
-        gap = 10000 + Math.random() * 10000; // 10-20s (2.2%)
+    if (gapRoll < 0.726) {
+        gap = 2000 + Math.random() * 1000; // 2-3s (72.6%)
+    } else if (gapRoll < 0.863) {
+        gap = 4000 + Math.random() * 1000; // 4-5s (13.7%)
+    } else if (gapRoll < 0.948) {
+        gap = 5000 + Math.random() * 5000; // 5-10s (8.5%)
+    } else if (gapRoll < 0.987) {
+        gap = 10000 + Math.random() * 10000; // 10-20s (3.9%)
     } else {
-        gap = 20000 + Math.random() * 10000; // 20s+ (0.9%)
+        gap = 20000 + Math.random() * 10000; // 20s+ (1.3%)
     }
 
     buildState.lastTradeTime = now;
@@ -2582,7 +2635,7 @@ const paperTradeMonitor = async () => {
     await cleanupExpiredMarketsAndPositions();
 
     // Start a separate fast price update loop (runs in parallel with main loop)
-    const FAST_PRICE_UPDATE_MS = 250; // Update prices every 250ms
+    const FAST_PRICE_UPDATE_MS = 50; // Update prices every 50ms - maximum speed
     let priceUpdateRunning = true;
     const fastPriceUpdateLoop = async () => {
         while (priceUpdateRunning && isRunning) {

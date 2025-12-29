@@ -1551,8 +1551,38 @@ class MarketTracker {
             await this.fetchCurrentPricesFromAPI(market);
         }
 
-        // Always log prices to CSV for live chart (every time this method is called)
-        // Use cached prices if available
+        // Only log prices for CURRENT active markets (not expired ones)
+        // This prevents multiple markets from the same category writing different prices
+        if (!market.endDate || market.endDate <= now) {
+            return; // Skip expired markets
+        }
+
+        // Check if this is the current active market for its category
+        // For hourly markets like BTC-UpDown-1h-6, extract base category BTC-UpDown-1h
+        const marketKey = market.marketKey;
+        let baseCategory: string;
+        if (marketKey.match(/-\d+$/)) {
+            baseCategory = marketKey.split('-').slice(0, 3).join('-'); // "BTC-UpDown-1h"
+        } else {
+            baseCategory = marketKey; // "BTC-UpDown-15"
+        }
+
+        // Find all markets in same category and check if this is the current one
+        const sameCategory = Array.from(this.markets.values()).filter(m => {
+            const mKey = m.marketKey;
+            const mBase = mKey.match(/-\d+$/) ? mKey.split('-').slice(0, 3).join('-') : mKey;
+            return mBase === baseCategory && m.endDate && m.endDate > now;
+        });
+
+        // Sort by endDate ascending - the one ending soonest is the current active market
+        sameCategory.sort((a, b) => (a.endDate || 0) - (b.endDate || 0));
+
+        // Only log if this is the current active market (first in sorted list)
+        if (sameCategory.length > 0 && sameCategory[0].marketKey !== marketKey) {
+            return; // Not the current active market, skip logging
+        }
+
+        // Log prices to CSV for live chart
         const priceUp = market.currentPriceUp ?? 0;
         const priceDown = market.currentPriceDown ?? 0;
 

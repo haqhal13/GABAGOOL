@@ -136,60 +136,126 @@ class TradeLogger {
     }
 
     /**
-     * Fetch market prices (UP and DOWN) for a condition ID
+     * Fetch REAL orderbook prices (ASK for buying) from CLOB API
+     * Returns the actual price you'd pay to buy UP or DOWN
      */
-    private async fetchMarketPrices(conditionId: string): Promise<{ priceUp: number; priceDown: number }> {
+    private async fetchOrderbookPrices(assetUpId: string, assetDownId: string): Promise<{ priceUp: number; priceDown: number } | null> {
+        try {
+            const [bookUp, bookDown] = await Promise.all([
+                fetchData(`https://clob.polymarket.com/book?token_id=${assetUpId}`).catch(() => null),
+                fetchData(`https://clob.polymarket.com/book?token_id=${assetDownId}`).catch(() => null)
+            ]);
+
+            let priceUp: number | null = null;
+            let priceDown: number | null = null;
+
+            // For UP: Get the ASK price (what you pay to buy)
+            if (bookUp?.asks?.length > 0) {
+                const bestAskUp = Math.min(...bookUp.asks.map((a: any) => parseFloat(a.price || 1)));
+                if (bestAskUp > 0 && bestAskUp <= 1) {
+                    priceUp = bestAskUp;
+                }
+            }
+
+            // For DOWN: Get the ASK price (what you pay to buy)
+            if (bookDown?.asks?.length > 0) {
+                const bestAskDown = Math.min(...bookDown.asks.map((a: any) => parseFloat(a.price || 1)));
+                if (bestAskDown > 0 && bestAskDown <= 1) {
+                    priceDown = bestAskDown;
+                }
+            }
+
+            if (priceUp !== null && priceDown !== null) {
+                return { priceUp, priceDown };
+            }
+            return null;
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * Fetch market prices (UP and DOWN) for a condition ID
+     * Now tries to get REAL orderbook prices first
+     */
+    private async fetchMarketPrices(conditionId: string, assetUpId?: string, assetDownId?: string): Promise<{ priceUp: number; priceDown: number }> {
         if (!conditionId) {
             return { priceUp: 0.5, priceDown: 0.5 };
         }
 
+        // If we have asset IDs, try to get REAL orderbook prices first
+        if (assetUpId && assetDownId) {
+            const orderbookPrices = await this.fetchOrderbookPrices(assetUpId, assetDownId);
+            if (orderbookPrices) {
+                return orderbookPrices;
+            }
+        }
+
         try {
-            // Try Gamma API first (more reliable for prices)
-            // Gamma's /markets/{id} expects a market ID, not a condition_id,
-            // so we query the markets list and match on condition_id.
+            // Try Gamma API to get asset IDs, then fetch REAL orderbook prices
             const gammaUrl = `https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=500`;
             const marketList = await fetchData(gammaUrl).catch(() => null);
 
             if (Array.isArray(marketList)) {
                 const marketData = marketList.find((m: any) => m.condition_id === conditionId);
                 if (marketData && marketData.tokens && Array.isArray(marketData.tokens)) {
-                let priceUp = 0.5;
-                let priceDown = 0.5;
-                let foundUp = false;
-                let foundDown = false;
+                    // Extract asset IDs for UP and DOWN tokens
+                    let tokenUpId: string | null = null;
+                    let tokenDownId: string | null = null;
 
-                for (const token of marketData.tokens) {
-                    const outcome = (token.outcome || '').toLowerCase();
-                    const price = parseFloat(token.price) || 0.5;
+                    for (const token of marketData.tokens) {
+                        const outcome = (token.outcome || '').toLowerCase();
+                        const tokenId = token.token_id;
 
-                    // Determine if this is UP or DOWN
-                    if (outcome.includes('up') || outcome.includes('yes') || outcome.includes('higher') || outcome.includes('above')) {
-                        priceUp = price;
-                        foundUp = true;
-                    } else if (outcome.includes('down') || outcome.includes('no') || outcome.includes('lower') || outcome.includes('below')) {
-                        priceDown = price;
-                        foundDown = true;
+                        if (outcome.includes('up') || outcome.includes('yes') || outcome.includes('higher') || outcome.includes('above')) {
+                            tokenUpId = tokenId;
+                        } else if (outcome.includes('down') || outcome.includes('no') || outcome.includes('lower') || outcome.includes('below')) {
+                            tokenDownId = tokenId;
+                        }
                     }
-                }
 
-                // If we found both prices, normalize them
-                if (foundUp && foundDown) {
-                    const total = priceUp + priceDown;
-                    if (total > 0 && total !== 1.0) {
-                        // Normalize if they don't sum to 1
-                        priceUp = priceUp / total;
-                        priceDown = priceDown / total;
+                    // If we have both token IDs, fetch REAL orderbook prices
+                    if (tokenUpId && tokenDownId) {
+                        const orderbookPrices = await this.fetchOrderbookPrices(tokenUpId, tokenDownId);
+                        if (orderbookPrices) {
+                            return orderbookPrices;
+                        }
                     }
-                    return { priceUp, priceDown };
-                } else if (foundUp || foundDown) {
-                    // If we only found one, calculate the other
-                    if (foundUp) {
-                        priceDown = 1.0 - priceUp;
-                    } else {
-                        priceUp = 1.0 - priceDown;
+
+                    // Fallback to mid-market prices from Gamma if orderbook fetch failed
+                    let priceUp = 0.5;
+                    let priceDown = 0.5;
+                    let foundUp = false;
+                    let foundDown = false;
+
+                    for (const token of marketData.tokens) {
+                        const outcome = (token.outcome || '').toLowerCase();
+                        const price = parseFloat(token.price) || 0.5;
+
+                        if (outcome.includes('up') || outcome.includes('yes') || outcome.includes('higher') || outcome.includes('above')) {
+                            priceUp = price;
+                            foundUp = true;
+                        } else if (outcome.includes('down') || outcome.includes('no') || outcome.includes('lower') || outcome.includes('below')) {
+                            priceDown = price;
+                            foundDown = true;
+                        }
                     }
-                    return { priceUp, priceDown };
-                }
+
+                    if (foundUp && foundDown) {
+                        const total = priceUp + priceDown;
+                        if (total > 0 && total !== 1.0) {
+                            priceUp = priceUp / total;
+                            priceDown = priceDown / total;
+                        }
+                        return { priceUp, priceDown };
+                    } else if (foundUp || foundDown) {
+                        if (foundUp) {
+                            priceDown = 1.0 - priceUp;
+                        } else {
+                            priceUp = 1.0 - priceDown;
+                        }
+                        return { priceUp, priceDown };
+                    }
                 }
             }
         } catch (error) {
@@ -310,25 +376,6 @@ class TradeLogger {
             const outcome = isUp ? 'UP' : 'DOWN';
             const tradePrice = parseFloat(activity.price || '0');
 
-            // For PAPER trades, use the actual market prices passed in (NOT trade price!)
-            // For WATCH trades, fetch current market prices from API
-            let prices: { priceUp: number; priceDown: number };
-            if (traderAddress === 'PAPER' && activity.marketPriceUp !== undefined && activity.marketPriceDown !== undefined) {
-                // PAPER trades include actual market prices - use them for accurate comparison
-                // This allows us to see the execution price difference vs mid-market
-                prices = { priceUp: activity.marketPriceUp, priceDown: activity.marketPriceDown };
-            } else if (traderAddress === 'PAPER') {
-                // Fallback for older PAPER trades without market prices
-                if (isUp) {
-                    prices = { priceUp: tradePrice, priceDown: 1.0 - tradePrice };
-                } else {
-                    prices = { priceUp: 1.0 - tradePrice, priceDown: tradePrice };
-                }
-            } else {
-                // WATCH trades - fetch current market prices
-                prices = await this.fetchMarketPrices(activity.conditionId);
-            }
-
             // Extract market key (similar to marketTracker logic)
             const marketKey = this.extractMarketKey(activity);
 
@@ -338,33 +385,41 @@ class TradeLogger {
             const size = parseFloat(activity.size || '0');
             const usdcSize = parseFloat(activity.usdcSize || '0');
             
-            // Use execution price to determine UP/DOWN prices at execution time
-            // This ensures execution price matches UP/DOWN columns for accurate analysis
-            // The execution price is the most accurate representation of what the market was at that moment
-            // Regular price updates (from marketTracker) will still use API prices for stability
+            // Use REAL prices for logging - the execution price IS the real market price
+            // The watcher's execution price comes directly from the orderbook at trade time
+            //
+            // PAPER trades pass marketPriceUp/marketPriceDown from the actual orderbook
+            // WATCH trades: Use the EXECUTION PRICE as market price (it's from the real orderbook!)
             let prices: { priceUp: number; priceDown: number };
-            if (tradePrice > 0 && tradePrice <= 1) {
+            if (activity.marketPriceUp !== undefined && activity.marketPriceDown !== undefined) {
+                // Use actual market prices passed by paper trades
+                prices = {
+                    priceUp: activity.marketPriceUp,
+                    priceDown: activity.marketPriceDown
+                };
+            } else {
+                // For WATCHER trades: The execution price IS the real orderbook price!
+                // Use execution price for the traded side, derive the other from (1 - price)
+                // This is accurate because UP + DOWN always sum to ~$1.00
                 if (isUp) {
-                    // UP trade executed at tradePrice, so UP price = tradePrice, DOWN = 1 - tradePrice
+                    // Bought UP at tradePrice, so priceUp = tradePrice, priceDown = 1 - tradePrice
                     prices = {
                         priceUp: tradePrice,
-                        priceDown: 1.0 - tradePrice
+                        priceDown: Math.max(0.01, 1.0 - tradePrice)
                     };
                 } else {
-                    // DOWN trade executed at tradePrice, so DOWN price = tradePrice, UP = 1 - tradePrice
+                    // Bought DOWN at tradePrice, so priceDown = tradePrice, priceUp = 1 - tradePrice
                     prices = {
-                        priceUp: 1.0 - tradePrice,
+                        priceUp: Math.max(0.01, 1.0 - tradePrice),
                         priceDown: tradePrice
                     };
                 }
-            } else {
-                // Fallback: fetch prices if tradePrice is invalid
-                prices = await this.fetchMarketPrices(activity.conditionId);
             }
-            
-            // Price differences are 0 since we use execution price as market price for trades
-            const priceDifferenceUp = 0;
-            const priceDifferenceDown = 0;
+
+            // Calculate price differences (execution price vs market price)
+            // This shows the arbitrage spread we're capturing!
+            const priceDifferenceUp = isUp ? (tradePrice - prices.priceUp) : 0;
+            const priceDifferenceDown = !isUp ? (tradePrice - prices.priceDown) : 0;
             
             // Update and get average costs for this market
             const conditionId = activity.conditionId || '';
@@ -435,28 +490,47 @@ class TradeLogger {
             fs.appendFileSync(this.csvFilePath, row + '\n', 'utf8');
             this.loggedTrades.add(tradeKey);
 
-            // Log to price stream with appropriate entry marker (WATCH or PAPER)
+            // Log to price stream with EXACT timestamp and EXECUTION price
+            // The execution price IS the real orderbook price at the time of the trade
             const marketTitle = activity.title || activity.slug || 'Unknown';
             const entryType = traderAddress === 'PAPER' ? 'PAPER' : 'WATCH';
             const entryNotes = `${outcome} ${size.toFixed(4)} shares @ $${tradePrice.toFixed(4)}`;
-            
+
+            // Use EXACT trade timestamp (convert from seconds to ms if needed)
+            const tradeTimestampMs = timestamp; // Already in ms from line 382
+
+            // For price stream: use EXECUTION price as the market price
+            // If bought UP at $0.02, show priceUp=$0.02, priceDown=$0.98
+            // This accurately reflects what was available on the orderbook
+            let streamPriceUp: number;
+            let streamPriceDown: number;
+            if (isUp) {
+                streamPriceUp = tradePrice;
+                streamPriceDown = Math.max(0.01, 1.0 - tradePrice);
+            } else {
+                streamPriceDown = tradePrice;
+                streamPriceUp = Math.max(0.01, 1.0 - tradePrice);
+            }
+
             if (entryType === 'PAPER') {
                 priceStreamLogger.markPaperEntry(
                     activity.slug || '',
                     marketTitle,
-                    prices.priceUp,
-                    prices.priceDown,
+                    streamPriceUp,
+                    streamPriceDown,
                     entryNotes,
-                    activity.transactionHash
+                    activity.transactionHash,
+                    tradeTimestampMs
                 );
             } else {
                 priceStreamLogger.markWatchEntry(
                     activity.slug || '',
                     marketTitle,
-                    prices.priceUp,
-                    prices.priceDown,
+                    streamPriceUp,
+                    streamPriceDown,
                     entryNotes,
-                    activity.transactionHash
+                    activity.transactionHash,
+                    tradeTimestampMs
                 );
             }
         } catch (error) {

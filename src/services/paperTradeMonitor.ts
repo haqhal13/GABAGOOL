@@ -241,6 +241,54 @@ async function getOrderBookPrice(assetId: string): Promise<number | null> {
 }
 
 /**
+ * Fetch ACTUAL execution prices from orderbook (BID for selling, ASK for buying)
+ * This returns the REAL prices watcher would get, not mid-market!
+ */
+async function getOrderBookExecutionPrices(assetUpId: string, assetDownId: string): Promise<{
+    execPriceUp: number | null;  // ASK price for buying UP
+    execPriceDown: number | null; // BID price for buying DOWN (which is ASK of the opposite)
+    midPriceUp: number | null;
+    midPriceDown: number | null;
+}> {
+    try {
+        // Fetch both orderbooks in parallel
+        const [bookUp, bookDown] = await Promise.all([
+            fetchData(`https://clob.polymarket.com/book?token_id=${assetUpId}`).catch(() => null),
+            fetchData(`https://clob.polymarket.com/book?token_id=${assetDownId}`).catch(() => null)
+        ]);
+
+        let execPriceUp: number | null = null;
+        let execPriceDown: number | null = null;
+        let midPriceUp: number | null = null;
+        let midPriceDown: number | null = null;
+
+        // For UP: We BUY at the ASK (pay more than mid)
+        if (bookUp?.bids?.length > 0 && bookUp?.asks?.length > 0) {
+            const bestBidUp = Math.max(...bookUp.bids.map((b: any) => parseFloat(b.price || 0)));
+            const bestAskUp = Math.min(...bookUp.asks.map((a: any) => parseFloat(a.price || 1)));
+            if (bestBidUp > 0 && bestAskUp > 0 && bestAskUp <= 1) {
+                execPriceUp = bestAskUp; // Buy UP at ASK
+                midPriceUp = (bestBidUp + bestAskUp) / 2;
+            }
+        }
+
+        // For DOWN: We BUY at the ASK of DOWN token (pay more than mid)
+        if (bookDown?.bids?.length > 0 && bookDown?.asks?.length > 0) {
+            const bestBidDown = Math.max(...bookDown.bids.map((b: any) => parseFloat(b.price || 0)));
+            const bestAskDown = Math.min(...bookDown.asks.map((a: any) => parseFloat(a.price || 1)));
+            if (bestBidDown > 0 && bestAskDown > 0 && bestAskDown <= 1) {
+                execPriceDown = bestAskDown; // Buy DOWN at its ASK
+                midPriceDown = (bestBidDown + bestAskDown) / 2;
+            }
+        }
+
+        return { execPriceUp, execPriceDown, midPriceUp, midPriceDown };
+    } catch (e) {
+        return { execPriceUp: null, execPriceDown: null, midPriceUp: null, midPriceDown: null };
+    }
+}
+
+/**
  * Fetch market expiration time from Gamma API using conditionId
  */
 async function fetchMarketExpiration(conditionId: string): Promise<number | null> {
@@ -1680,39 +1728,23 @@ async function buildPositionIncrementally(market: typeof discoveredMarkets exten
     }
 
     // ==========================================================================
-    // WATCHER ARBITRAGE PATTERN (from LIVE data - Dec 28)
-    // Watcher buys BOTH sides to guarantee profit:
-    // - UP @ $0.09-0.12 when market UP=$0.54 (buys at BID, ~80% discount!)
-    // - DOWN @ $0.87-0.91 when market DOWN=$0.47 (buys at ASK, ~85% premium!)
-    // Total cost: ~$0.98, Payout: $1.00, Guaranteed profit: ~$0.02/share
-    //
-    // KEY INSIGHT: Watcher uses ORDERBOOK edges, not mid-market!
-    // - For UP: Buy at BID (much lower than mid-market)
-    // - For DOWN: Buy at ASK (much higher than mid-market, but 1-ASK_UP)
+    // USE REAL ORDERBOOK PRICES ONLY - Same as watcher!
+    // Fetch actual ASK prices for buying (this is what watcher pays)
+    // NO FALLBACK - Skip trade if real prices not available
     // ==========================================================================
 
-    // Calculate execution prices using ORDERBOOK ARBITRAGE pattern
-    let execPriceUp = market.priceUp;
-    let execPriceDown = market.priceDown;
+    // Get REAL execution prices from the orderbook
+    const orderBookPrices = await getOrderBookExecutionPrices(market.assetUp, market.assetDown);
 
-    // The spread from mid to orderbook edge is typically 70-85% in these markets
-    // UP: Buy at BID = mid * (1 - spread) where spread ~ 0.75-0.85
-    // DOWN: Buy at ASK = 1 - (mid_up * (1 - spread)) which is high
+    // CRITICAL: Only trade with REAL orderbook prices - NO estimates!
+    if (orderBookPrices.execPriceUp === null || orderBookPrices.execPriceDown === null) {
+        debugLog(`buildPosition: ${market.marketKey} - SKIPPED (no real orderbook prices available)`);
+        return;
+    }
 
-    // UP execution: Buy at BID (massive discount from mid-market)
-    // When UP mid = $0.54, BID might be $0.09-0.12 (83% discount)
-    const upSpread = 0.75 + Math.random() * 0.10; // 75-85% discount
-    execPriceUp = Math.max(0.02, market.priceUp * (1 - upSpread));
-
-    // DOWN execution: Buy at ASK = 1 - BID_UP (the other side of the spread)
-    // When we buy UP at $0.10, DOWN costs $0.90 (1 - 0.10)
-    // This ensures total cost is ~$0.98-1.00
-    const downSpread = 0.75 + Math.random() * 0.10; // Same spread
-    execPriceDown = Math.min(0.98, 1 - (market.priceUp * (1 - downSpread)));
-
-    // Ensure reasonable bounds
-    execPriceUp = Math.max(0.05, Math.min(0.20, execPriceUp));
-    execPriceDown = Math.max(0.80, Math.min(0.95, execPriceDown));
+    // Use REAL ASK prices only
+    const execPriceUp = Math.max(0.02, Math.min(0.98, orderBookPrices.execPriceUp));
+    const execPriceDown = Math.max(0.02, Math.min(0.98, orderBookPrices.execPriceDown));
 
     // Execute UP trade (minimum 0.5 shares like watcher)
     if (sharesUp >= MIN_SHARES && tradeUp > 0 && currentCapital >= tradeUp) {

@@ -4,11 +4,11 @@
 
 ### Option 1: Using npm script (Recommended)
 ```bash
-npm run
+npm start
 ```
 or
 ```bash
-npm start-bot
+npm run start-bot
 ```
 
 ### Option 2: Using the run script
@@ -21,12 +21,47 @@ npm start-bot
 npm run dev
 ```
 
-## What the Bot Does
+## Mode Selection
 
-- **Tracks** wallet: `0x6031b6eed1c97e853c6e0f03ad3ce3529351f96d`
-- **Mode**: Track-only (monitoring, no trading)
-- **Updates**: Every 0.5 seconds
-- **Shows**: Market tracking with UP/DOWN stats, average prices, and investment splits
+When you start the bot, you'll be prompted to select a mode:
+
+1. **📊 Paper Mode** - Independent paper trading (simulated, no real money)
+2. **👀 Watcher Mode** - Monitor trader activity (read-only, no trading)
+3. **💰 Trading Mode** - Real trading (executes actual trades)
+
+You can also set the mode via environment variables:
+```bash
+# Paper mode
+PAPER_MODE=true npm start
+
+# Watcher mode
+TRACK_ONLY_MODE=true npm start
+
+# Trading mode (default)
+npm start
+```
+
+## What Each Mode Does
+
+### Paper Mode
+- Simulates trading independently
+- Discovers markets using same criteria as watcher mode
+- Shows real-time PnL, positions, and market statistics
+- Logs to `logs/paper/` directory
+- **No real money involved**
+
+### Watcher Mode
+- Monitors trader activity from addresses in `USER_ADDRESSES`
+- Displays dashboard with up to 4 markets
+- Shows real-time PnL, positions, and market statistics
+- Logs to `logs/watcher/` directory
+- **Read-only, no trades executed**
+
+### Trading Mode
+- Monitors traders and automatically copies their trades
+- Executes real trades on Polymarket
+- Uses your wallet balance and private key
+- **Real money involved - use with caution**
 
 ## Stop the Bot
 
@@ -34,8 +69,17 @@ Press `Ctrl+C` in the terminal where it's running.
 
 ## View Logs
 
-Logs are saved in the `logs/` directory:
+Logs are saved in the `logs/` directory organized by mode:
+- `logs/watcher/` - Watcher mode logs
+- `logs/paper/` - Paper mode logs
+- `logs/Live prices/` - Price stream logs (all modes)
+
+View recent logs:
 ```bash
-tail -f logs/bot-$(date +%Y-%m-%d).log
+# Watcher trades
+tail -f logs/watcher/Watcher_Trades_*.csv
+
+# Paper trades
+tail -f logs/paper/Paper_Trades_*.csv
 ```
 

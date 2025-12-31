@@ -1,0 +1,98 @@
+{
+  "bot_name": "gabagool22_replica",
+  "version": "1.0.0",
+  "source_trader": {
+    "address": "0x6031b6eed1c97e853c6e0f03ad3ce3529351f96d",
+    "name": "gabagool22"
+  },
+  "market_config": {
+    "supported_markets": [
+      "BTC-UpDown-15",
+      "ETH-UpDown-15",
+      "BTC-UpDown-1h",
+      "ETH-UpDown-1h"
+    ],
+    "parallel_trading": true,
+    "max_concurrent_markets": 4
+  },
+  "trade_frequency_model": {
+    "min_interval_ms": 0,
+    "burst_enabled": true,
+    "max_trades_per_second": 15,
+    "cooldown_after_burst_ms": 0,
+    "notes": "HIGH CONFIDENCE - Observed bursts of 10+ trades/second"
+  },
+  "bias_function": {
+    "type": "dual_side_accumulator",
+    "description": "Buy both UP and DOWN, with bias toward cheaper side",
+    "base_allocation": {
+      "when_50_50": {
+        "up": 0.5,
+        "down": 0.5
+      },
+      "when_60_40": {
+        "up": 0.45,
+        "down": 0.55
+      },
+      "when_70_30": {
+        "up": 0.4,
+        "down": 0.6
+      },
+      "when_80_20": {
+        "up": 0.35,
+        "down": 0.65
+      }
+    },
+    "minority_side_premium": 0.1,
+    "notes": "MEDIUM CONFIDENCE - Inferred from side distribution by skew"
+  },
+  "minority_side_rule": {
+    "enabled": true,
+    "trigger_skew_threshold": 0.05,
+    "allocation_boost_percent": 10,
+    "notes": "HIGH CONFIDENCE - Consistently buys minority side"
+  },
+  "scaling_curve": {
+    "type": "adaptive",
+    "base_size_shares": 12.0,
+    "min_size_shares": 0.01,
+    "max_size_shares": 25.0,
+    "mean_size_shares": 12.552884808993792,
+    "size_increases_with_discount": true,
+    "discount_multiplier": 1.5,
+    "notes": "MEDIUM CONFIDENCE - Size varies, larger on discounts"
+  },
+  "position_limits": {
+    "max_position_per_market_usd": 1500.0,
+    "max_trade_size_shares": 24.0,
+    "min_trade_size_shares": 0.07,
+    "notes": "HIGH CONFIDENCE - Derived from observed maximums"
+  },
+  "risk_controls": {
+    "stop_loss_enabled": false,
+    "take_profit_enabled": false,
+    "max_drawdown_percent": null,
+    "notes": "HIGH CONFIDENCE - No early exits observed"
+  },
+  "switching_logic": {
+    "switch_on_market_closed": true,
+    "switch_on_new_market": true,
+    "snapshot_on_switch": true,
+    "notes": "HIGH CONFIDENCE - Observed in Market Switch Reason field"
+  },
+  "capital_allocation": {
+    "total_bankroll_estimated_usd": 5000.0,
+    "per_market_allocation_percent": 30,
+    "notes": "MEDIUM CONFIDENCE - Estimated from total invested"
+  },
+  "resolution_hold_behavior": {
+    "always_hold_to_resolution": true,
+    "sell_before_resolution": false,
+    "notes": "HIGH CONFIDENCE - No sells observed"
+  },
+  "timing_effects": {
+    "trade_near_resolution": true,
+    "resolution_rush_window_seconds": 120,
+    "notes": "MEDIUM CONFIDENCE - Trading continues until resolution"
+  }
+}

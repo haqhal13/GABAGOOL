@@ -1,0 +1,8 @@
+# Easy Wallet Configuration
+# Just put your wallet address on the line below (or replace the default)
+# The bot will automatically use this address when you run it
+# You can also use multiple addresses by separating them with commas
+# Example: 0xABC..., 0xDEF...
+# Lines starting with # are ignored
+
+0x6031b6eed1c97e853c6e0f03ad3ce3529351f96d

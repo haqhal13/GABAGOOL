@@ -1283,19 +1283,20 @@ class MarketTracker {
             const marketSlugForNotify = market.marketSlug || '';
             if (marketSlugForNotify) {
                 const is15Min = marketSlugForNotify.includes('updown-15m');
-                const isHourly = marketSlugForNotify.includes('updown-1h') || marketKey.includes('-1h');
+                const isHourly = !is15Min && marketKey.includes('-1h');
                 const isBTC = marketKey.includes('BTC');
                 const type: 'BTC' | 'ETH' = isBTC ? 'BTC' : 'ETH';
                 const timeframe: '15m' | '1h' = is15Min ? '15m' : '1h';
 
-                // Extract window start timestamp from slug
+                // Extract window start timestamp
                 let windowStart = 0;
                 if (is15Min) {
+                    // 15-min markets: extract from slug
                     const match = marketSlugForNotify.match(/updown-15m-(\d+)/);
                     if (match) windowStart = parseInt(match[1], 10);
-                } else if (isHourly) {
-                    const match = marketSlugForNotify.match(/updown-1h-(\d+)/);
-                    if (match) windowStart = parseInt(match[1], 10);
+                } else if (isHourly && market.endDate) {
+                    // Hourly markets: calculate from endDate (endDate - 1 hour = start)
+                    windowStart = Math.floor(market.endDate / 1000) - 3600;
                 }
 
                 if (windowStart > 0) {
@@ -2266,6 +2267,89 @@ class MarketTracker {
     }
 
     /**
+     * Get current live prices for a market by slug pattern
+     * This is used to inject exact orderbook prices into trades before logging
+     */
+    getLivePricesBySlug(slug: string): { priceUp: number; priceDown: number } | null {
+        if (!slug) return null;
+
+        const slugLower = slug.toLowerCase();
+
+        // Find market that matches this slug pattern
+        for (const market of this.markets.values()) {
+            const marketSlugLower = (market.marketSlug || '').toLowerCase();
+
+            // Direct slug match
+            if (marketSlugLower === slugLower) {
+                if (market.currentPriceUp !== undefined && market.currentPriceDown !== undefined) {
+                    return { priceUp: market.currentPriceUp, priceDown: market.currentPriceDown };
+                }
+            }
+
+            // Pattern match (btc-updown-15m, eth-updown-15m, etc.)
+            if (slugLower.includes('btc-updown-15m') && marketSlugLower.includes('btc-updown-15m')) {
+                if (market.currentPriceUp !== undefined && market.currentPriceDown !== undefined) {
+                    return { priceUp: market.currentPriceUp, priceDown: market.currentPriceDown };
+                }
+            }
+            if (slugLower.includes('eth-updown-15m') && marketSlugLower.includes('eth-updown-15m')) {
+                if (market.currentPriceUp !== undefined && market.currentPriceDown !== undefined) {
+                    return { priceUp: market.currentPriceUp, priceDown: market.currentPriceDown };
+                }
+            }
+            if (slugLower.includes('btc') && slugLower.includes('1h') && marketSlugLower.includes('btc') && marketSlugLower.includes('1h')) {
+                if (market.currentPriceUp !== undefined && market.currentPriceDown !== undefined) {
+                    return { priceUp: market.currentPriceUp, priceDown: market.currentPriceDown };
+                }
+            }
+            if (slugLower.includes('eth') && slugLower.includes('1h') && marketSlugLower.includes('eth') && marketSlugLower.includes('1h')) {
+                if (market.currentPriceUp !== undefined && market.currentPriceDown !== undefined) {
+                    return { priceUp: market.currentPriceUp, priceDown: market.currentPriceDown };
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Fetch FRESH prices from CLOB API for a market by slug
+     * This fetches directly from the orderbook - not cached values
+     * Returns null if unable to fetch (missing asset IDs, API failure, etc.)
+     */
+    async fetchFreshPricesBySlug(slug: string): Promise<{ priceUp: number; priceDown: number } | null> {
+        if (!slug) return null;
+
+        const slugLower = slug.toLowerCase();
+
+        // Find market that matches this slug pattern to get asset IDs
+        for (const market of this.markets.values()) {
+            const marketSlugLower = (market.marketSlug || '').toLowerCase();
+
+            // Check for match
+            const isMatch = marketSlugLower === slugLower ||
+                (slugLower.includes('btc-updown-15m') && marketSlugLower.includes('btc-updown-15m')) ||
+                (slugLower.includes('eth-updown-15m') && marketSlugLower.includes('eth-updown-15m')) ||
+                (slugLower.includes('btc') && slugLower.includes('1h') && marketSlugLower.includes('btc') && marketSlugLower.includes('1h')) ||
+                (slugLower.includes('eth') && slugLower.includes('1h') && marketSlugLower.includes('eth') && marketSlugLower.includes('1h'));
+
+            if (isMatch && market.assetUp && market.assetDown) {
+                // Fetch BOTH prices from CLOB API in parallel
+                const [priceUp, priceDown] = await Promise.all([
+                    this.fetchOrderBookPrice(market.assetUp),
+                    this.fetchOrderBookPrice(market.assetDown)
+                ]);
+
+                if (priceUp !== null && priceDown !== null) {
+                    return { priceUp, priceDown };
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
      * Update market asset IDs (used when we fetch assets from Gamma API)
      * This allows price fetching to work when watcher trades only provided one asset
      */
@@ -2665,14 +2749,18 @@ class MarketTracker {
                 const type: 'BTC' | 'ETH' = isBTC ? 'BTC' : 'ETH';
                 const timeframe: '15m' | '1h' = is15Min ? '15m' : '1h';
 
-                // Extract window start timestamp from slug
+                // Extract window start timestamp
                 let windowStart = 0;
                 if (is15Min) {
+                    // 15-min markets: extract from slug (e.g., btc-updown-15m-1735545600)
                     const match = slug.match(/updown-15m-(\d+)/);
                     if (match) windowStart = parseInt(match[1], 10);
                 } else {
-                    const match = slug.match(/updown-1h-(\d+)/);
-                    if (match) windowStart = parseInt(match[1], 10);
+                    // Hourly markets: calculate from endDate (endDate - 1 hour = start)
+                    // Hourly slugs are like "btc-6am-et-up-down" without timestamp
+                    if (endDate) {
+                        windowStart = Math.floor(endDate / 1000) - 3600; // endDate in ms, subtract 1 hour
+                    }
                 }
 
                 if (windowStart > 0) {

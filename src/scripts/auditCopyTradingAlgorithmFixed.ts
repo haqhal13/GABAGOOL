@@ -2,6 +2,7 @@ import axios from 'axios';
 import * as fs from 'fs';
 import * as path from 'path';
 import { ENV } from '../config/env';
+import { readWalletFile } from '../utils/readWalletFile';
 
 // Console colors
 const colors = {
@@ -130,10 +131,14 @@ const MAX_TRADES_LIMIT = parseInt(process.env.SIM_MAX_TRADES || '3000');
 const COPY_PERCENTAGE = parseFloat(process.env.COPY_PERCENTAGE || '1.0'); // Copy 1% of trader's order size by default
 
 function parseTraderAddresses(): string[] {
-    const envAddresses = process.env.AUDIT_ADDRESSES || process.env.USER_ADDRESSES || '';
+    // Check wallet file first (easiest way to configure)
+    const walletFromFile = readWalletFile();
+    
+    // Priority: AUDIT_ADDRESSES > wallet file > USER_ADDRESSES env > default
+    const envAddresses = process.env.AUDIT_ADDRESSES || walletFromFile || process.env.USER_ADDRESSES || '';
 
     if (!envAddresses) {
-        console.log(colors.yellow('⚠️  No AUDIT_ADDRESSES or USER_ADDRESSES found in environment'));
+        console.log(colors.yellow('⚠️  No AUDIT_ADDRESSES, wallet file, or USER_ADDRESSES found'));
         console.log(colors.yellow('    Using default test addresses...\n'));
         return [
             '0x7c3db723f1d4d8cb9c550095203b686cb11e5c6b',

@@ -43,13 +43,27 @@ npm run setup
 # Build and start
 npm run build
 npm run health-check  # Verify configuration
-npm start             # Start trading
+npm start             # Start bot (interactive mode selection)
+```
+
+When you run `npm start`, you'll be prompted to select a mode:
+- Paper Mode (simulated trading)
+- Watcher Mode (monitoring only)
+- Trading Mode (real execution)
+
+You can also set modes via environment variables:
+```bash
+PAPER_MODE=true npm start        # Paper mode
+TRACK_ONLY_MODE=true npm start   # Watcher mode
+npm start                        # Trading mode (default)
 ```
 
 **📖 For detailed setup instructions, see [Getting Started Guide](./docs/GETTING_STARTED.md)**
+**📖 For quick run instructions, see [Quick Run Guide](./README_RUN.md)**
 
 ## Features
 
+- **Three Operating Modes** - Paper trading, Watcher mode, and Live trading
 - **Multi-Trader Support** - Track and copy trades from multiple traders simultaneously
 - **Smart Position Sizing** - Automatically adjusts trade sizes based on your capital
 - **Tiered Multipliers** - Apply different multipliers based on trade size
@@ -58,12 +72,61 @@ npm start             # Start trading
 - **Real-time Execution** - Monitors trades every second and executes instantly
 - **MongoDB Integration** - Persistent storage of all trades and positions
 - **Price Protection** - Built-in slippage checks to avoid unfavorable fills
+- **Comprehensive Logging** - CSV logs for trades, PnL, and price streams organized by mode
+
+### Operating Modes
+
+The bot supports three distinct modes that you can select when starting:
+
+1. **📊 Paper Mode** - Independent paper trading simulation
+   - Simulates trading without using real money
+   - Discovers markets independently using same criteria as watcher
+   - Perfect for testing strategies and understanding market behavior
+   - Logs saved to `logs/paper/`
+
+2. **👀 Watcher Mode** - Monitor trader activity (read-only)
+   - Tracks trader positions from addresses in `USER_ADDRESSES`
+   - Displays real-time dashboard with up to 4 markets
+   - Shows PnL, positions, and market statistics
+   - No trades executed - monitoring only
+   - Logs saved to `logs/watcher/`
+
+3. **💰 Trading Mode** - Real trading with automatic execution
+   - Monitors traders and automatically copies their trades
+   - Executes real trades on Polymarket using your wallet
+   - Uses proportional position sizing based on capital
+   - **⚠️ Uses real money - trade with caution**
 
 ### Monitoring Method
 
 The bot currently uses the **Polymarket Data API** to monitor trader activity and detect new positions. The monitoring system polls trader positions at configurable intervals (default: 1 second) to ensure timely trade detection and execution.
 
 ## Configuration
+
+### Easy Wallet Configuration 🎯
+
+**The easiest way to set which wallet to track:** Just edit the `wallet` file!
+
+```bash
+# Open the wallet file
+nano wallet
+# or
+code wallet
+# or any text editor
+
+# Replace the address with the wallet you want to track
+0x6031b6eed1c97e853c6e0f03ad3ce3529351f96d
+```
+
+The bot will automatically use the address from the `wallet` file. You can also:
+- Add multiple addresses separated by commas: `0xABC..., 0xDEF...`
+- Add comments with `#` for notes
+- The bot prioritizes: `wallet` file → `USER_ADDRESSES` env var → default
+
+**Priority order:**
+1. `wallet` file (easiest - just edit and save!)
+2. `USER_ADDRESSES` environment variable
+3. Default address (0x6031b6eed1c97e853c6e0f03ad3ce3529351f96d)
 
 ### Essential Variables
 
@@ -106,6 +169,13 @@ docker-compose logs -f polymarket
 ### Getting Started
 - **[🚀 Getting Started Guide](./docs/GETTING_STARTED.md)** - Complete beginner's guide
 - **[⚡ Quick Start](./docs/QUICK_START.md)** - Fast setup for experienced users
+- **[🏃 Quick Run Guide](./README_RUN.md)** - How to run the bot and select modes
+
+### Advanced Guides
+- **[Multi-Trader Guide](./docs/MULTI_TRADER_GUIDE.md)** - Track multiple traders
+- **[Simulation Guide](./docs/SIMULATION_GUIDE.md)** - Test strategies with simulations
+- **[Position Tracking](./docs/POSITION_TRACKING.md)** - Understand position management
+- **[Docker Deployment](./docs/DOCKER.md)** - Production deployment
 
 ## License
 

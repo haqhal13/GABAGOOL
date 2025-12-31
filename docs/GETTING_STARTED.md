@@ -59,14 +59,22 @@ npm run build
 npm run health-check
 ```
 
-### Step 4: Start Trading
+### Step 4: Start the Bot
 
 ```bash
 # Start the bot
 npm start
 ```
 
-That's it! Your bot is now running and will copy trades automatically.
+When you run `npm start`, you'll be prompted to select a mode:
+
+1. **📊 Paper Mode** - Simulated trading (no real money)
+2. **👀 Watcher Mode** - Monitor traders (read-only, no trading)
+3. **💰 Trading Mode** - Real trading (executes actual trades)
+
+**For first-time users, we recommend starting with Watcher Mode** to see how the bot tracks traders before enabling real trading.
+
+That's it! Your bot is now running. In Trading Mode, it will automatically copy trades from the traders you specified.
 
 ---
 

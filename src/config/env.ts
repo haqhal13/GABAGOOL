@@ -1,5 +1,6 @@
 import * as dotenv from 'dotenv';
 import { CopyStrategy, CopyStrategyConfig, parseTieredMultipliers } from './copyStrategy';
+import { readWalletFile } from '../utils/readWalletFile';
 // Note: dotenv.config() is now called in index.ts BEFORE this module is imported
 // This allows the interactive menu to set TRACK_ONLY_MODE before validation
 if (!process.env.DOTENV_LOADED) {
@@ -9,6 +10,13 @@ if (!process.env.DOTENV_LOADED) {
 
 // Default trader to watch if USER_ADDRESSES isn't provided
 const DEFAULT_USER_ADDRESSES = '0x6031b6eed1c97e853c6e0f03ad3ce3529351f96d';
+
+// Read wallet file first (easiest way to change wallet)
+// Wallet file takes priority over USER_ADDRESSES env var
+const walletFromFile = readWalletFile();
+if (walletFromFile) {
+    process.env.USER_ADDRESSES = walletFromFile;
+}
 
 // Default network endpoints
 const DEFAULTS = {

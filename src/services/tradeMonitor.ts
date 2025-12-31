@@ -219,6 +219,24 @@ const fetchTradeData = async () => {
                     processedTrades.add(tradeKey);
                 }
                 
+                // Fetch FRESH prices from CLOB API at the moment of trade
+                // This gets the ACTUAL orderbook prices for both UP and DOWN - no calculation
+                const freshPrices = await marketTracker.fetchFreshPricesBySlug(activity.slug || '');
+                if (freshPrices) {
+                    // Inject fresh API prices into activity for accurate logging
+                    activity.marketPriceUp = freshPrices.priceUp;
+                    activity.marketPriceDown = freshPrices.priceDown;
+                    console.log(`📊 FRESH API PRICES: UP=$${freshPrices.priceUp.toFixed(4)} DOWN=$${freshPrices.priceDown.toFixed(4)}`);
+                } else {
+                    // Fallback to cached prices if fresh fetch fails
+                    const cachedPrices = marketTracker.getLivePricesBySlug(activity.slug || '');
+                    if (cachedPrices) {
+                        activity.marketPriceUp = cachedPrices.priceUp;
+                        activity.marketPriceDown = cachedPrices.priceDown;
+                        console.log(`📊 CACHED PRICES: UP=$${cachedPrices.priceUp.toFixed(4)} DOWN=$${cachedPrices.priceDown.toFixed(4)}`);
+                    }
+                }
+
                 // Log trade with detailed information (including market prices)
                 tradeLogger.logTrade(activity, address).catch((error) => {
                     Logger.error(`Error logging trade: ${error}`);

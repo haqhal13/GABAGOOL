@@ -1,402 +1,1275 @@
 /**
- * Price Stream Logger
+ * Price Stream Logger - WebSocket-based Real-time Price Streaming
  *
- * Logs real-time orderbook prices with millisecond precision
- * Inserts watcher/paper trades at their exact timestamps with matching prices
+ * Streams BTC/ETH Up/Down market prices from Polymarket's CLOB WebSocket.
+ * Automatically switches to the next market when the current one ends.
+ * Integrates with existing bot infrastructure for trade logging.
  *
- * IMPORTANT: Paper mode and Watch mode use SEPARATE CSV files to prevent data conflicts
+ * Based on: https://github.com/haqhal13/CVSMODULE
  */
 
+import WebSocket from 'ws';
 import * as fs from 'fs';
 import * as path from 'path';
 import { getRunId } from '../utils/runId';
-import { ENV } from '../config/env';
 
-/**
- * Helper function to break down timestamp into detailed components
- */
-function getTimestampBreakdown(timestamp: number): {
-    year: number;
-    month: number;
-    day: number;
-    hour: number;
-    minute: number;
-    second: number;
-    millisecond: number;
-} {
-    const date = new Date(timestamp);
-    return {
-        year: date.getUTCFullYear(),
-        month: date.getUTCMonth() + 1, // 1-12
-        day: date.getUTCDate(),
-        hour: date.getUTCHours(),
-        minute: date.getUTCMinutes(),
-        second: date.getUTCSeconds(),
-        millisecond: date.getUTCMilliseconds(),
-    };
+// ============================================================================
+// Configuration
+// ============================================================================
+
+const CONFIG = {
+  // Market discovery settings - multiple market types to track
+  MARKET_SLUG_PREFIXES: [
+    'btc-updown-15m',           // BTC 15-minute
+    'eth-updown-15m',           // ETH 15-minute
+    'bitcoin-up-or-down',       // BTC hourly
+    'ethereum-up-or-down',      // ETH hourly
+  ],
+  GAMMA_API_URL: 'https://gamma-api.polymarket.com/events',
+  CLOB_API_URL: 'https://clob.polymarket.com',
+
+  // Timing
+  MARKET_CHECK_INTERVAL_MS: parseInt(process.env.MARKET_CHECK_INTERVAL_MS || '30000', 10),
+  MARKET_SWITCH_BUFFER_MS: parseInt(process.env.MARKET_SWITCH_BUFFER_MS || '60000', 10),
+  FLUSH_EVERY_MS: parseInt(process.env.FLUSH_EVERY_MS || '5000', 10), // Flush every 5s for more frequent writes
+
+  // WebSocket
+  WS_URL: 'wss://ws-subscriptions-clob.polymarket.com/ws/market',
+  PING_INTERVAL_MS: 5000,
+  RECONNECT_BACKOFF_MS: parseInt(process.env.RECONNECT_BACKOFF_MS || '1000', 10),
+  MAX_RECONNECT_BACKOFF_MS: 60000,
+
+  // Logging
+  LOG_LEVEL: (process.env.PRICE_LOG_LEVEL || 'info') as 'debug' | 'info' | 'warn' | 'error',
+};
+
+// ============================================================================
+// Types
+// ============================================================================
+
+interface OrderBookLevel {
+  price: string;
+  size: string;
 }
 
-/**
- * Extract market key from market slug/title
- */
-function extractMarketKey(slug: string, title: string): { type: 'BTC' | 'ETH' | null; timeframe: '15m' | '1h' | null } {
+interface BookEvent {
+  event_type: 'book';
+  asset_id: string;
+  market: string;
+  bids: OrderBookLevel[];
+  asks: OrderBookLevel[];
+  timestamp: string;
+}
+
+interface PriceChangeItem {
+  asset_id: string;
+  price: string;
+  size: string;
+  side: 'BUY' | 'SELL';
+  best_bid?: string;
+  best_ask?: string;
+}
+
+interface PriceChangeEvent {
+  event_type: 'price_change';
+  market: string;
+  price_changes: PriceChangeItem[];
+  timestamp: string;
+}
+
+interface LastTradePriceEvent {
+  event_type: 'last_trade_price';
+  asset_id: string;
+  market: string;
+  price: string;
+  side: 'BUY' | 'SELL';
+  size: string;
+  timestamp: string;
+}
+
+interface BestBidAskEvent {
+  event_type: 'best_bid_ask';
+  market: string;
+  asset_id: string;
+  best_bid: string;
+  best_ask: string;
+  timestamp: string;
+}
+
+type MarketEvent = BookEvent | PriceChangeEvent | LastTradePriceEvent | BestBidAskEvent;
+
+interface AssetState {
+  lastPrice: number | null;
+  bestBid: number | null;
+  bestAsk: number | null;
+  lastTradePrice: number | null;
+  marketConditionId: string | null;
+}
+
+interface MarketToken {
+  token_id: string;
+  outcome: string;
+  winner?: boolean;
+}
+
+interface MarketInfo {
+  condition_id: string;
+  slug: string;
+  question: string;
+  end_date_iso: string;
+  start_time_iso: string;
+  tokens: MarketToken[];
+  closed: boolean;
+  active: boolean;
+  market_type: string;
+}
+
+interface GammaEvent {
+  id: string;
+  slug: string;
+  title: string;
+  endDate: string;
+  startTime: string | null;
+  closed: boolean;
+  active: boolean;
+  markets: GammaMarket[];
+}
+
+interface GammaMarket {
+  id: string;
+  conditionId: string;
+  slug: string;
+  question: string;
+  endDate: string;
+  eventStartTime: string | null;
+  closed: boolean;
+  active: boolean;
+  clobTokenIds: string;
+  outcomes: string;
+}
+
+// CSV Row format matching your existing structure
+interface CSVRow {
+  timestamp: number;
+  date: string;
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+  millisecond: number;
+  priceUp: number;
+  priceDown: number;
+  upBid: number | null;
+  upAsk: number | null;
+  downBid: number | null;
+  downAsk: number | null;
+  entryType: string;  // 'WATCH', 'PAPER', or '' for price-only rows
+  watchEntry: string;
+  paperEntry: string;
+  notes: string;
+}
+
+// ============================================================================
+// Logging
+// ============================================================================
+
+const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
+
+function log(level: 'debug' | 'info' | 'warn' | 'error', message: string, data?: unknown): void {
+  if (LOG_LEVELS[level] >= LOG_LEVELS[CONFIG.LOG_LEVEL]) {
+    const timestamp = new Date().toISOString();
+    const prefix = `[${timestamp}] [PRICE] [${level.toUpperCase()}]`;
+    if (data !== undefined) {
+      console.log(`${prefix} ${message}`, data);
+    } else {
+      console.log(`${prefix} ${message}`);
+    }
+  }
+}
+
+function getTimestampBreakdown(timestamp: number): {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+  millisecond: number;
+} {
+  const date = new Date(timestamp);
+  return {
+    year: date.getUTCFullYear(),
+    month: date.getUTCMonth() + 1,
+    day: date.getUTCDate(),
+    hour: date.getUTCHours(),
+    minute: date.getUTCMinutes(),
+    second: date.getUTCSeconds(),
+    millisecond: date.getUTCMilliseconds(),
+  };
+}
+
+function normalizeTimestamp(ts: number): number {
+  return ts < 1e12 ? ts * 1000 : ts;
+}
+
+// ============================================================================
+// Market Discovery
+// ============================================================================
+
+class MarketDiscovery {
+  private currentMarkets: Map<string, MarketInfo> = new Map();
+  private nextMarkets: Map<string, MarketInfo> = new Map();
+
+  async fetchAllMarkets(): Promise<MarketInfo[]> {
+    try {
+      const allMarkets: MarketInfo[] = [];
+
+      // Fetch hourly markets
+      const hourlyUrl = `${CONFIG.GAMMA_API_URL}?tag_slug=up-or-down&active=true&closed=false&limit=100&order=endDate&ascending=true`;
+      const hourlyMarkets = await this.fetchMarketsFromUrl(hourlyUrl);
+      allMarkets.push(...hourlyMarkets);
+
+      // Fetch 15m markets
+      for (const prefix of ['btc-updown-15m', 'eth-updown-15m']) {
+        const now = Math.floor(Date.now() / 1000);
+        for (let offset = -1; offset <= 8; offset++) {
+          const targetTime = now + (offset * 900);
+          const roundedTime = Math.floor(targetTime / 900) * 900;
+          const slug = `${prefix}-${roundedTime}`;
+          const marketUrl = `${CONFIG.GAMMA_API_URL}?slug=${slug}`;
+          const markets = await this.fetchMarketsFromUrl(marketUrl);
+          allMarkets.push(...markets);
+        }
+      }
+
+      // Deduplicate
+      const uniqueMarkets = new Map<string, MarketInfo>();
+      for (const market of allMarkets) {
+        if (!uniqueMarkets.has(market.condition_id)) {
+          uniqueMarkets.set(market.condition_id, market);
+        }
+      }
+
+      const markets = Array.from(uniqueMarkets.values());
+      markets.sort((a, b) => new Date(a.end_date_iso).getTime() - new Date(b.end_date_iso).getTime());
+
+      return markets;
+    } catch (error) {
+      log('error', 'Failed to fetch markets:', error);
+      return [];
+    }
+  }
+
+  private async fetchMarketsFromUrl(url: string): Promise<MarketInfo[]> {
+    try {
+      const response = await fetch(url);
+      if (!response.ok) return [];
+
+      const events = (await response.json()) as GammaEvent[];
+      const markets: MarketInfo[] = [];
+
+      for (const event of events) {
+        const marketType = CONFIG.MARKET_SLUG_PREFIXES.find(prefix => event.slug.startsWith(prefix));
+        if (!marketType) continue;
+
+        for (const market of event.markets) {
+          let tokenIds: string[] = [];
+          let outcomeNames: string[] = [];
+
+          try {
+            if (market.clobTokenIds) tokenIds = JSON.parse(market.clobTokenIds) as string[];
+            if (market.outcomes) outcomeNames = JSON.parse(market.outcomes) as string[];
+          } catch {
+            continue;
+          }
+
+          if (tokenIds.length >= 2) {
+            const tokens: MarketToken[] = tokenIds.map((tokenId: string, idx: number) => ({
+              token_id: tokenId,
+              outcome: outcomeNames[idx] || (idx === 0 ? 'Up' : 'Down'),
+            }));
+
+            const startTime = event.startTime || market.eventStartTime || market.endDate;
+
+            markets.push({
+              condition_id: market.conditionId,
+              slug: market.slug || event.slug,
+              question: market.question || event.title,
+              end_date_iso: market.endDate || event.endDate,
+              start_time_iso: startTime,
+              tokens,
+              closed: market.closed || event.closed,
+              active: market.active && event.active,
+              market_type: marketType,
+            });
+          }
+        }
+      }
+
+      return markets;
+    } catch {
+      return [];
+    }
+  }
+
+  async findCurrentMarketsForAllTypes(): Promise<Map<string, MarketInfo>> {
+    const allMarkets = await this.fetchAllMarkets();
+    const now = Date.now();
+
+    this.currentMarkets.clear();
+    this.nextMarkets.clear();
+
+    const marketsByType = new Map<string, MarketInfo[]>();
+    for (const market of allMarkets) {
+      if (!marketsByType.has(market.market_type)) {
+        marketsByType.set(market.market_type, []);
+      }
+      marketsByType.get(market.market_type)!.push(market);
+    }
+
+    for (const marketType of CONFIG.MARKET_SLUG_PREFIXES) {
+      const markets = marketsByType.get(marketType) || [];
+      let current: MarketInfo | null = null;
+      let next: MarketInfo | null = null;
+
+      for (const market of markets) {
+        const startTime = new Date(market.start_time_iso).getTime();
+        const endTime = new Date(market.end_date_iso).getTime();
+
+        if (endTime > now) {
+          if (startTime <= now) {
+            if (!current) current = market;
+          } else {
+            if (current && !next) {
+              next = market;
+              break;
+            } else if (!current) {
+              current = market;
+            }
+          }
+        }
+      }
+
+      if (current) {
+        this.currentMarkets.set(marketType, current);
+        log('info', `[${marketType}] Current: ${current.question}`);
+      }
+      if (next) {
+        this.nextMarkets.set(marketType, next);
+      }
+    }
+
+    return this.currentMarkets;
+  }
+
+  getCurrentMarkets(): Map<string, MarketInfo> {
+    return this.currentMarkets;
+  }
+
+  getAllAssetIds(): string[] {
+    const assetIds: string[] = [];
+    Array.from(this.currentMarkets.values()).forEach(market => {
+      for (const token of market.tokens) {
+        assetIds.push(token.token_id);
+      }
+    });
+    return assetIds;
+  }
+
+  getMarketByAssetId(assetId: string): MarketInfo | null {
+    const markets = Array.from(this.currentMarkets.values());
+    for (const market of markets) {
+      if (market.tokens.some(t => t.token_id === assetId)) {
+        return market;
+      }
+    }
+    return null;
+  }
+
+  getMarketTypesNeedingSwitch(): string[] {
+    const now = Date.now();
+    const needsSwitch: string[] = [];
+    Array.from(this.currentMarkets.entries()).forEach(([marketType, market]) => {
+      const endTime = new Date(market.end_date_iso).getTime();
+      const timeLeft = endTime - now;
+      if (timeLeft < CONFIG.MARKET_SWITCH_BUFFER_MS || timeLeft < 0) {
+        needsSwitch.push(marketType);
+      }
+    });
+    return needsSwitch;
+  }
+
+  hasAnyMarketEnded(): boolean {
+    const now = Date.now();
+    const markets = Array.from(this.currentMarkets.values());
+    for (const market of markets) {
+      const endTime = new Date(market.end_date_iso).getTime();
+      if (now > endTime) return true;
+    }
+    return false;
+  }
+}
+
+// ============================================================================
+// CSV Writer - Compatible with existing format
+// ============================================================================
+
+class CSVWriter {
+  private buffer: CSVRow[] = [];
+  private writeStream: fs.WriteStream;
+  private flushInterval: NodeJS.Timeout | null = null;
+  private headerWritten = false;
+  private recentRowKeys: Set<string> = new Set();
+  private lastWrittenTimestamp: number = 0;
+  private static DEDUP_WINDOW_SIZE = 100;
+
+  constructor(private filePath: string, private flushEveryMs: number) {
+    const dir = path.dirname(filePath);
+    if (dir && !fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+
+    this.headerWritten = fs.existsSync(filePath) && fs.statSync(filePath).size > 0;
+    this.writeStream = fs.createWriteStream(filePath, { flags: 'a' });
+
+    if (!this.headerWritten) {
+      this.writeHeader();
+    }
+
+    this.startFlushInterval();
+    log('info', `CSV writer initialized: ${filePath}`);
+  }
+
+  private writeHeader(): void {
+    const header = [
+      'Timestamp',
+      'Date',
+      'Year',
+      'Month',
+      'Day',
+      'Hour',
+      'Minute',
+      'Second',
+      'Millisecond',
+      'Price UP ($)',
+      'Price DOWN ($)',
+      'UP Bid',
+      'UP Ask',
+      'DOWN Bid',
+      'DOWN Ask',
+      'Entry Type',       // WATCH, PAPER, or empty for price-only
+      'Watch Mode Entry',
+      'Paper Mode Entry',
+      'Notes'
+    ].join(',') + '\n';
+    this.writeStream.write(header);
+    this.headerWritten = true;
+  }
+
+  private startFlushInterval(): void {
+    if (this.flushEveryMs <= 0) return;
+    this.flushInterval = setInterval(() => {
+      this.flush();
+    }, this.flushEveryMs);
+  }
+
+  addRow(row: CSVRow): boolean {
+    const rowKey = `${row.timestamp}|${row.priceUp.toFixed(4)}|${row.priceDown.toFixed(4)}`;
+    const isTradeEntry = row.watchEntry === 'YES' || row.paperEntry === 'YES';
+
+    // For trade entries, use a different dedup key that includes the notes
+    const dedupeKey = isTradeEntry
+      ? `${row.timestamp}|${row.notes}`
+      : rowKey;
+
+    if (this.recentRowKeys.has(dedupeKey)) {
+      return false;
+    }
+
+    // Only apply timestamp ordering check to price rows, not trade entries
+    // Trade entries may come in slightly after their actual timestamp
+    if (!isTradeEntry && row.timestamp < this.lastWrittenTimestamp - 1000) {
+      return false;
+    }
+
+    // Validate price consistency
+    const total = row.priceUp + row.priceDown;
+    if (row.priceUp > 0 && row.priceDown > 0 && Math.abs(total - 1.0) > 0.05) {
+      return false;
+    }
+
+    this.recentRowKeys.add(dedupeKey);
+    if (this.recentRowKeys.size > CSVWriter.DEDUP_WINDOW_SIZE) {
+      const keysArray = Array.from(this.recentRowKeys);
+      this.recentRowKeys = new Set(keysArray.slice(keysArray.length / 2));
+    }
+
+    // Only update lastWrittenTimestamp for price rows, not trade entries
+    // This prevents trade entries from blocking future price rows
+    if (!isTradeEntry) {
+      this.lastWrittenTimestamp = row.timestamp;
+    }
+
+    this.buffer.push(row);
+    return true;
+  }
+
+  flush(): void {
+    if (this.buffer.length === 0) return;
+
+    const rows = this.buffer.splice(0, this.buffer.length);
+
+    const csvLines = rows.map(row => {
+      const tb = getTimestampBreakdown(row.timestamp);
+      const values = [
+        row.timestamp,
+        row.date,
+        tb.year,
+        tb.month,
+        tb.day,
+        tb.hour,
+        tb.minute,
+        tb.second,
+        tb.millisecond,
+        row.priceUp.toFixed(4),
+        row.priceDown.toFixed(4),
+        row.upBid !== null ? row.upBid.toFixed(4) : '',
+        row.upAsk !== null ? row.upAsk.toFixed(4) : '',
+        row.downBid !== null ? row.downBid.toFixed(4) : '',
+        row.downAsk !== null ? row.downAsk.toFixed(4) : '',
+        row.entryType || '',  // WATCH, PAPER, or empty
+        row.watchEntry,
+        row.paperEntry,
+        row.notes ? `"${row.notes.replace(/"/g, '""')}"` : '',
+      ];
+      return values.join(',');
+    }).join('\n') + '\n';
+
+    this.writeStream.write(csvLines);
+  }
+
+  close(): Promise<void> {
+    return new Promise((resolve) => {
+      if (this.flushInterval) {
+        clearInterval(this.flushInterval);
+      }
+      this.flush();
+      this.writeStream.end(() => {
+        resolve();
+      });
+    });
+  }
+}
+
+// ============================================================================
+// Price Calculator
+// ============================================================================
+
+function safeParseNumber(value: string | undefined | null): number | null {
+  if (value === undefined || value === null || value === '') return null;
+  const num = Number(value);
+  return isNaN(num) ? null : num;
+}
+
+function computeMidPrice(bestBid: number | null, bestAsk: number | null): number | null {
+  if (bestBid !== null && bestAsk !== null && bestBid > 0 && bestAsk > 0) {
+    return (bestBid + bestAsk) / 2;
+  }
+  return null;
+}
+
+function getBestFromBook(levels: OrderBookLevel[], isBid: boolean): number | null {
+  if (!levels || levels.length === 0) return null;
+
+  const validLevels = levels.filter(l => {
+    const size = safeParseNumber(l.size);
+    return size !== null && size > 0;
+  });
+
+  if (validLevels.length === 0) return null;
+
+  const sorted = validLevels.sort((a, b) => {
+    const priceA = safeParseNumber(a.price) || 0;
+    const priceB = safeParseNumber(b.price) || 0;
+    return isBid ? priceB - priceA : priceA - priceB;
+  });
+
+  return safeParseNumber(sorted[0].price);
+}
+
+// ============================================================================
+// Pending Price Data
+// ============================================================================
+
+interface PendingPrice {
+  price: number;
+  bid: number | null;
+  ask: number | null;
+  assetId: string;
+  ts_ms: number;
+}
+
+interface PendingRow {
+  marketType: string;
+  up: PendingPrice | null;
+  down: PendingPrice | null;
+  lastUpdate: number;
+}
+
+// ============================================================================
+// Price Stream Logger - Main Class
+// ============================================================================
+
+class PriceStreamLogger {
+  private ws: WebSocket | null = null;
+  private assetStates: Map<string, AssetState> = new Map();
+  private writers: Map<string, CSVWriter> = new Map();
+  private marketDiscovery: MarketDiscovery;
+  private reconnectAttempts = 0;
+  private reconnectTimeout: NodeJS.Timeout | null = null;
+  private pingInterval: NodeJS.Timeout | null = null;
+  private marketCheckInterval: NodeJS.Timeout | null = null;
+  private isShuttingDown = false;
+  private isConnected = false;
+  private isStarted = false;
+  private currentAssetIds: string[] = [];
+  private pendingRows: Map<string, PendingRow> = new Map();
+
+  // For trade entry marking
+  private loggedTradeEntries: Set<string> = new Set();
+
+  // Price history for lookups
+  private priceHistory: Map<string, Array<{ timestamp: number; priceUp: number; priceDown: number }>> = new Map();
+  private maxPriceHistorySize = 600;
+
+  constructor() {
+    this.marketDiscovery = new MarketDiscovery();
+
+    const logsDir = path.join(process.cwd(), 'logs');
+    const livePricesDir = path.join(logsDir, 'Live prices');
+
+    if (!fs.existsSync(livePricesDir)) {
+      fs.mkdirSync(livePricesDir, { recursive: true });
+    }
+
+    const runId = getRunId();
+
+    // Initialize CSV writers for each market type with your existing naming convention
+    const marketFiles: Record<string, string> = {
+      'btc-updown-15m': `BTC - 15 min prices_${runId}.csv`,
+      'eth-updown-15m': `ETH - 15 min prices_${runId}.csv`,
+      'bitcoin-up-or-down': `BTC - 1 hour prices_${runId}.csv`,
+      'ethereum-up-or-down': `ETH - 1 hour prices_${runId}.csv`,
+    };
+
+    for (const [marketType, filename] of Object.entries(marketFiles)) {
+      const filePath = path.join(livePricesDir, filename);
+      this.writers.set(marketType, new CSVWriter(filePath, CONFIG.FLUSH_EVERY_MS));
+    }
+
+    log('info', `Price Stream Logger initialized with ${this.writers.size} CSV files`);
+  }
+
+  async start(): Promise<void> {
+    if (this.isStarted) {
+      log('warn', 'Price stream already started');
+      return;
+    }
+
+    this.isStarted = true;
+    log('info', 'Starting WebSocket price stream...');
+
+    await this.discoverAndConnect();
+    this.startMarketCheckInterval();
+  }
+
+  async stop(): Promise<void> {
+    log('info', 'Stopping price stream...');
+    this.isShuttingDown = true;
+
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+    }
+
+    this.stopPingInterval();
+    this.stopMarketCheckInterval();
+
+    if (this.ws) {
+      this.ws.close(1000, 'Shutdown');
+    }
+
+    const closePromises: Promise<void>[] = [];
+    Array.from(this.writers.values()).forEach(writer => {
+      closePromises.push(writer.close());
+    });
+    await Promise.all(closePromises);
+
+    this.isStarted = false;
+    log('info', 'Price stream stopped');
+  }
+
+  private async discoverAndConnect(): Promise<void> {
+    log('info', 'Discovering Up/Down markets...');
+
+    const currentMarkets = await this.marketDiscovery.findCurrentMarketsForAllTypes();
+
+    if (currentMarkets.size === 0) {
+      log('warn', 'No active markets found. Will retry in 30 seconds...');
+      return;
+    }
+
+    const assetIds = this.marketDiscovery.getAllAssetIds();
+
+    if (assetIds.length === 0) {
+      log('error', 'No asset IDs found');
+      return;
+    }
+
+    if (this.arraysEqual(assetIds, this.currentAssetIds)) {
+      return;
+    }
+
+    this.currentAssetIds = assetIds;
+    this.initializeAssetStates(assetIds);
+
+    if (this.ws) {
+      this.ws.close(1000, 'Market switch');
+    }
+
+    this.connect();
+  }
+
+  private initializeAssetStates(assetIds: string[]): void {
+    this.assetStates.clear();
+    for (const assetId of assetIds) {
+      this.assetStates.set(assetId, {
+        lastPrice: null,
+        bestBid: null,
+        bestAsk: null,
+        lastTradePrice: null,
+        marketConditionId: null,
+      });
+    }
+  }
+
+  private arraysEqual(a: string[], b: string[]): boolean {
+    if (a.length !== b.length) return false;
+    const sortedA = [...a].sort();
+    const sortedB = [...b].sort();
+    return sortedA.every((val, idx) => val === sortedB[idx]);
+  }
+
+  private startMarketCheckInterval(): void {
+    this.stopMarketCheckInterval();
+
+    this.marketCheckInterval = setInterval(async () => {
+      if (this.isShuttingDown) return;
+
+      const needsSwitch = this.marketDiscovery.getMarketTypesNeedingSwitch();
+      if (needsSwitch.length > 0 || this.marketDiscovery.hasAnyMarketEnded()) {
+        await this.discoverAndConnect();
+      }
+    }, CONFIG.MARKET_CHECK_INTERVAL_MS);
+  }
+
+  private stopMarketCheckInterval(): void {
+    if (this.marketCheckInterval) {
+      clearInterval(this.marketCheckInterval);
+      this.marketCheckInterval = null;
+    }
+  }
+
+  private connect(): void {
+    if (this.isShuttingDown) return;
+    if (this.currentAssetIds.length === 0) return;
+
+    log('info', `Connecting to WebSocket...`);
+
+    this.ws = new WebSocket(CONFIG.WS_URL);
+
+    this.ws.on('open', () => this.onOpen());
+    this.ws.on('message', (data) => this.onMessage(data));
+    this.ws.on('error', (error) => this.onError(error));
+    this.ws.on('close', (code, reason) => this.onClose(code, reason));
+    this.ws.on('pong', () => log('debug', 'Received pong'));
+  }
+
+  private onOpen(): void {
+    log('info', 'WebSocket connected');
+    this.isConnected = true;
+    this.reconnectAttempts = 0;
+
+    this.subscribe();
+    this.startPingInterval();
+  }
+
+  private subscribe(): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+    const subscribeMsg = {
+      assets_ids: this.currentAssetIds,
+      type: 'market',
+    };
+
+    log('info', `Subscribing to ${this.currentAssetIds.length} assets`);
+    this.ws.send(JSON.stringify(subscribeMsg));
+  }
+
+  private startPingInterval(): void {
+    this.stopPingInterval();
+    this.pingInterval = setInterval(() => {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.ping();
+      }
+    }, CONFIG.PING_INTERVAL_MS);
+  }
+
+  private stopPingInterval(): void {
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval);
+      this.pingInterval = null;
+    }
+  }
+
+  private onMessage(data: WebSocket.RawData): void {
+    try {
+      const message = JSON.parse(data.toString());
+      const events: MarketEvent[] = Array.isArray(message) ? message : [message];
+
+      for (const event of events) {
+        this.processEvent(event);
+      }
+    } catch (error) {
+      log('error', 'Failed to parse message:', error);
+    }
+  }
+
+  private processEvent(event: MarketEvent): void {
+    if (!event.event_type) return;
+
+    switch (event.event_type) {
+      case 'book':
+        this.handleBookEvent(event);
+        break;
+      case 'price_change':
+        this.handlePriceChangeEvent(event);
+        break;
+      case 'last_trade_price':
+        this.handleLastTradePriceEvent(event);
+        break;
+      case 'best_bid_ask':
+        this.handleBestBidAskEvent(event);
+        break;
+    }
+  }
+
+  private handleBookEvent(event: BookEvent): void {
+    const { asset_id, market, bids, asks, timestamp } = event;
+    if (!this.assetStates.has(asset_id)) return;
+
+    const state = this.assetStates.get(asset_id)!;
+    const bestBid = getBestFromBook(bids, true);
+    const bestAsk = getBestFromBook(asks, false);
+
+    state.bestBid = bestBid;
+    state.bestAsk = bestAsk;
+    state.marketConditionId = market;
+
+    const midPrice = computeMidPrice(bestBid, bestAsk);
+    const price = midPrice ?? state.lastTradePrice;
+
+    if (price !== null) {
+      this.maybeWriteRow(asset_id, price, bestBid, bestAsk, timestamp);
+    }
+  }
+
+  private handlePriceChangeEvent(event: PriceChangeEvent): void {
+    const { market, price_changes, timestamp } = event;
+
+    for (const change of price_changes) {
+      const { asset_id, best_bid, best_ask } = change;
+      if (!this.assetStates.has(asset_id)) continue;
+
+      const state = this.assetStates.get(asset_id)!;
+      state.marketConditionId = market;
+
+      if (best_bid !== undefined) state.bestBid = safeParseNumber(best_bid);
+      if (best_ask !== undefined) state.bestAsk = safeParseNumber(best_ask);
+
+      const midPrice = computeMidPrice(state.bestBid, state.bestAsk);
+      const price = midPrice ?? state.lastTradePrice;
+
+      if (price !== null) {
+        this.maybeWriteRow(asset_id, price, state.bestBid, state.bestAsk, timestamp);
+      }
+    }
+  }
+
+  private handleLastTradePriceEvent(event: LastTradePriceEvent): void {
+    const { asset_id, market, price: priceStr, timestamp } = event;
+    if (!this.assetStates.has(asset_id)) return;
+
+    const state = this.assetStates.get(asset_id)!;
+    const tradePrice = safeParseNumber(priceStr);
+
+    if (tradePrice === null) return;
+
+    state.lastTradePrice = tradePrice;
+    state.marketConditionId = market;
+
+    const midPrice = computeMidPrice(state.bestBid, state.bestAsk);
+    const price = midPrice ?? tradePrice;
+
+    this.maybeWriteRow(asset_id, price, state.bestBid, state.bestAsk, timestamp);
+  }
+
+  private handleBestBidAskEvent(event: BestBidAskEvent): void {
+    const { asset_id, market, best_bid, best_ask, timestamp } = event;
+    if (!this.assetStates.has(asset_id)) return;
+
+    const state = this.assetStates.get(asset_id)!;
+    state.bestBid = safeParseNumber(best_bid);
+    state.bestAsk = safeParseNumber(best_ask);
+    state.marketConditionId = market;
+
+    const midPrice = computeMidPrice(state.bestBid, state.bestAsk);
+    const price = midPrice ?? state.lastTradePrice;
+
+    if (price !== null) {
+      this.maybeWriteRow(asset_id, price, state.bestBid, state.bestAsk, timestamp);
+    }
+  }
+
+  private maybeWriteRow(
+    assetId: string,
+    price: number,
+    bestBid: number | null,
+    bestAsk: number | null,
+    timestampStr: string
+  ): void {
+    const state = this.assetStates.get(assetId)!;
+
+    const roundedPrice = Math.round(price * 1e6) / 1e6;
+    const roundedLastPrice = state.lastPrice !== null ? Math.round(state.lastPrice * 1e6) / 1e6 : null;
+
+    if (roundedPrice === roundedLastPrice) return;
+
+    state.lastPrice = roundedPrice;
+
+    const tsMs = safeParseNumber(timestampStr) ?? Date.now();
+
+    const market = this.marketDiscovery.getMarketByAssetId(assetId);
+    const token = market?.tokens.find((t: MarketToken) => t.token_id === assetId);
+    const outcomeLabel = token?.outcome || 'Unknown';
+    const marketType = market?.market_type || 'Unknown';
+
+    const pendingPrice: PendingPrice = {
+      price: roundedPrice,
+      bid: bestBid,
+      ask: bestAsk,
+      assetId: assetId,
+      ts_ms: tsMs,
+    };
+
+    let pending = this.pendingRows.get(marketType);
+    if (!pending) {
+      pending = { marketType, up: null, down: null, lastUpdate: tsMs };
+      this.pendingRows.set(marketType, pending);
+    }
+
+    // Clear stale data
+    const STALE_THRESHOLD_MS = 5000;
+    if (pending.up && (tsMs - pending.up.ts_ms) > STALE_THRESHOLD_MS) pending.up = null;
+    if (pending.down && (tsMs - pending.down.ts_ms) > STALE_THRESHOLD_MS) pending.down = null;
+
+    const isUp = outcomeLabel.toUpperCase() === 'UP';
+    if (isUp) {
+      pending.up = pendingPrice;
+    } else {
+      pending.down = pendingPrice;
+    }
+    pending.lastUpdate = tsMs;
+
+    // Combine UP and DOWN into single row
+    if (pending.up && pending.down) {
+      const timeDiff = Math.abs(pending.up.ts_ms - pending.down.ts_ms);
+
+      if (timeDiff <= 2000) {
+        this.writeCombinedRow(marketType, pending);
+        pending.up = null;
+        pending.down = null;
+      } else {
+        if (pending.up.ts_ms < pending.down.ts_ms) {
+          pending.up = null;
+        } else {
+          pending.down = null;
+        }
+      }
+    }
+  }
+
+  private writeCombinedRow(marketType: string, pending: PendingRow): void {
+    const writer = this.writers.get(marketType);
+    if (!writer) return;
+
+    const tsMs = pending.lastUpdate;
+    const priceUp = pending.up?.price || 0;
+    const priceDown = pending.down?.price || 0;
+
+    const row: CSVRow = {
+      timestamp: tsMs,
+      date: new Date(tsMs).toISOString(),
+      year: 0, month: 0, day: 0, hour: 0, minute: 0, second: 0, millisecond: 0,
+      priceUp,
+      priceDown,
+      upBid: pending.up?.bid || null,
+      upAsk: pending.up?.ask || null,
+      downBid: pending.down?.bid || null,
+      downAsk: pending.down?.ask || null,
+      entryType: '',  // Price-only row
+      watchEntry: '',
+      paperEntry: '',
+      notes: '',
+    };
+
+    if (writer.addRow(row)) {
+      // Store in price history for trade lookups
+      const historyKey = this.getHistoryKey(marketType);
+      let history = this.priceHistory.get(historyKey);
+      if (!history) {
+        history = [];
+        this.priceHistory.set(historyKey, history);
+      }
+      history.push({ timestamp: tsMs, priceUp, priceDown });
+      if (history.length > this.maxPriceHistorySize) {
+        history.shift();
+      }
+    }
+  }
+
+  private getHistoryKey(marketType: string): string {
+    if (marketType.includes('btc') || marketType.includes('bitcoin')) {
+      return marketType.includes('15m') ? 'BTC-15m' : 'BTC-1h';
+    }
+    return marketType.includes('15m') ? 'ETH-15m' : 'ETH-1h';
+  }
+
+  private onError(error: Error): void {
+    log('error', 'WebSocket error:', error.message);
+  }
+
+  private onClose(code: number, reason: Buffer): void {
+    log('warn', `WebSocket closed: code=${code}`);
+    this.isConnected = false;
+    this.stopPingInterval();
+
+    if (!this.isShuttingDown) {
+      this.scheduleReconnect();
+    }
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+    }
+
+    const backoff = Math.min(
+      CONFIG.RECONNECT_BACKOFF_MS * Math.pow(2, this.reconnectAttempts),
+      CONFIG.MAX_RECONNECT_BACKOFF_MS
+    );
+
+    log('info', `Reconnecting in ${backoff}ms...`);
+
+    this.reconnectTimeout = setTimeout(async () => {
+      this.reconnectAttempts++;
+      await this.discoverAndConnect();
+    }, backoff);
+  }
+
+  // ============================================================================
+  // Public API - Compatible with existing interface
+  // ============================================================================
+
+  /**
+   * Log price update - now handled automatically by WebSocket
+   * Kept for backward compatibility but does nothing
+   */
+  logPrice(_marketSlug: string, _marketTitle: string, _priceUp: number, _priceDown: number): void {
+    // Prices are now streamed via WebSocket - this is a no-op for compatibility
+  }
+
+  /**
+   * Notify that a new market window has started
+   * Now handled automatically by market discovery
+   */
+  notifyNewMarketWindow(_type: 'BTC' | 'ETH', _timeframe: '15m' | '1h', _windowStartTimestamp: number): void {
+    // Market windows are now tracked automatically
+  }
+
+  /**
+   * Check if logging is enabled for a market
+   */
+  isLoggingEnabled(_type: 'BTC' | 'ETH', _timeframe: '15m' | '1h'): boolean {
+    return this.isConnected;
+  }
+
+  /**
+   * Mark a watcher trade entry in the CSV
+   */
+  markWatchEntry(
+    marketSlug: string,
+    marketTitle: string,
+    priceUp: number,
+    priceDown: number,
+    notes?: string,
+    transactionHash?: string,
+    tradeTimestamp?: number
+  ): void {
+    const marketType = this.getMarketTypeFromSlug(marketSlug, marketTitle);
+    if (!marketType) return;
+
+    const writer = this.writers.get(marketType);
+    if (!writer) return;
+
+    const tradeKey = transactionHash ? `WATCH:${transactionHash}` : `WATCH:${marketType}:${notes}`;
+    if (this.loggedTradeEntries.has(tradeKey)) return;
+    this.loggedTradeEntries.add(tradeKey);
+
+    const timestamp = tradeTimestamp || Date.now();
+
+    // Look up prices from history if available
+    const historyKey = this.getHistoryKey(marketType);
+    const prices = this.findPriceAtTimestamp(historyKey, timestamp);
+    const finalPriceUp = prices?.priceUp || priceUp;
+    const finalPriceDown = prices?.priceDown || priceDown;
+
+    const row: CSVRow = {
+      timestamp,
+      date: new Date(timestamp).toISOString(),
+      year: 0, month: 0, day: 0, hour: 0, minute: 0, second: 0, millisecond: 0,
+      priceUp: finalPriceUp,
+      priceDown: finalPriceDown,
+      upBid: null,
+      upAsk: null,
+      downBid: null,
+      downAsk: null,
+      entryType: 'WATCH',
+      watchEntry: 'YES',
+      paperEntry: '',
+      notes: `WATCH: ${notes || ''}`,
+    };
+
+    writer.addRow(row);
+    log('info', `Logged WATCH entry: ${notes}`);
+  }
+
+  /**
+   * Mark a paper trade entry in the CSV
+   */
+  markPaperEntry(
+    marketSlug: string,
+    marketTitle: string,
+    priceUp: number,
+    priceDown: number,
+    notes?: string,
+    transactionHash?: string,
+    tradeTimestamp?: number
+  ): void {
+    const marketType = this.getMarketTypeFromSlug(marketSlug, marketTitle);
+    if (!marketType) return;
+
+    const writer = this.writers.get(marketType);
+    if (!writer) return;
+
+    const tradeKey = transactionHash ? `PAPER:${transactionHash}` : `PAPER:${marketType}:${notes}`;
+    if (this.loggedTradeEntries.has(tradeKey)) return;
+    this.loggedTradeEntries.add(tradeKey);
+
+    const timestamp = tradeTimestamp || Date.now();
+
+    // Look up prices from history if available
+    const historyKey = this.getHistoryKey(marketType);
+    const prices = this.findPriceAtTimestamp(historyKey, timestamp);
+    const finalPriceUp = prices?.priceUp || priceUp;
+    const finalPriceDown = prices?.priceDown || priceDown;
+
+    const row: CSVRow = {
+      timestamp,
+      date: new Date(timestamp).toISOString(),
+      year: 0, month: 0, day: 0, hour: 0, minute: 0, second: 0, millisecond: 0,
+      priceUp: finalPriceUp,
+      priceDown: finalPriceDown,
+      upBid: null,
+      upAsk: null,
+      downBid: null,
+      downAsk: null,
+      entryType: 'PAPER',
+      watchEntry: '',
+      paperEntry: 'YES',
+      notes: `PAPER: ${notes || ''}`,
+    };
+
+    writer.addRow(row);
+    log('info', `Logged PAPER entry: ${notes}`);
+  }
+
+  /**
+   * Get current prices (for compatibility)
+   */
+  getCurrentPrices(_marketSlug: string, _marketTitle: string): { priceUp: number; priceDown: number } | null {
+    return null;
+  }
+
+  private getMarketTypeFromSlug(slug: string, title: string): string | null {
     const searchText = `${slug} ${title}`.toLowerCase();
 
     const isBTC = searchText.includes('bitcoin') || searchText.includes('btc');
     const isETH = searchText.includes('ethereum') || searchText.includes('eth');
 
-    if (!isBTC && !isETH) {
-        return { type: null, timeframe: null };
+    if (!isBTC && !isETH) return null;
+
+    const is15Min = /\b15\s*min|\b15min|updown.*?15|15.*?updown/i.test(searchText) ||
+                    /\d{1,2}:\d{2}\s*(?:am|pm)\s*[-–]\s*\d{1,2}:\d{2}\s*(?:am|pm)/i.test(searchText);
+
+    if (isBTC) {
+      return is15Min ? 'btc-updown-15m' : 'bitcoin-up-or-down';
+    } else {
+      return is15Min ? 'eth-updown-15m' : 'ethereum-up-or-down';
+    }
+  }
+
+  private findPriceAtTimestamp(historyKey: string, targetTimestamp: number): { priceUp: number; priceDown: number } | null {
+    const history = this.priceHistory.get(historyKey);
+    if (!history || history.length === 0) return null;
+
+    let closest = history[0];
+    let closestDiff = Math.abs(closest.timestamp - targetTimestamp);
+
+    for (const point of history) {
+      const diff = Math.abs(point.timestamp - targetTimestamp);
+      if (diff < closestDiff) {
+        closestDiff = diff;
+        closest = point;
+      }
     }
 
-    // Check for 15-minute timeframe - explicit text
-    const hasExplicit15Min = /\b15\s*min|\b15min|updown.*?15|15.*?updown/i.test(searchText);
+    if (closestDiff <= 5000) {
+      return { priceUp: closest.priceUp, priceDown: closest.priceDown };
+    }
 
-    // Check for 15-minute timeframe - time range pattern like "6:00AM-6:15AM"
-    const hasTimeRange = /\d{1,2}:\d{2}\s*(?:am|pm)\s*[-–]\s*\d{1,2}:\d{2}\s*(?:am|pm)/i.test(searchText);
-
-    // 15min markets have either explicit "15min" OR a time range with colons
-    const is15Min = hasExplicit15Min || hasTimeRange;
-
-    // Check for hourly timeframe (explicit)
-    const hasHourly = /\b1\s*h|\b1\s*hour|\bhourly/i.test(searchText);
-
-    // Check for hourly markets by pattern
-    const hasUpDown = /(?:up|down).*?(?:up|down)|updown/i.test(searchText);
-    const hasSingleTime = /\d{1,2}\s*(?:am|pm)\s*et/i.test(searchText) || /\d{1,2}(?:am|pm)-et/i.test(searchText);
-    const isHourlyPattern = hasUpDown && hasSingleTime && !hasTimeRange;
-
-    const type = isBTC ? 'BTC' : 'ETH';
-    const timeframe = is15Min ? '15m' : (hasHourly || isHourlyPattern) ? '1h' : null;
-
-    return { type, timeframe };
+    const latest = history[history.length - 1];
+    return { priceUp: latest.priceUp, priceDown: latest.priceDown };
+  }
 }
 
-class PriceStreamLogger {
-    private btc15mPath: string;
-    private eth15mPath: string;
-    private btc1hPath: string;
-    private eth1hPath: string;
-    // Track logged trades to prevent duplicates
-    private loggedTradeEntries: Set<string> = new Set();
-    // Track last logged timestamp per market (to avoid duplicate rows at same ms)
-    private lastLoggedTimestamp: Map<string, number> = new Map();
-    // Track current market window start times - only log when we've seen a new market
-    // Key: "BTC-15m", "ETH-15m", "BTC-1h", "ETH-1h"
-    // Value: Unix timestamp (seconds) of the current market window start
-    private currentMarketWindow: Map<string, number> = new Map();
-    // Track if logging is enabled for each market (enabled when new market window starts)
-    private loggingEnabled: Map<string, boolean> = new Map();
+// Create singleton instance
+const priceStreamLogger = new PriceStreamLogger();
 
-    constructor() {
-        const logsDir = path.join(process.cwd(), 'logs');
-        const livePricesDir = path.join(logsDir, 'Live prices');
+// Auto-start when imported (will run in background)
+priceStreamLogger.start().catch(err => {
+  console.error('Failed to start price stream:', err);
+});
 
-        // Create directories
-        if (!fs.existsSync(logsDir)) {
-            fs.mkdirSync(logsDir, { recursive: true });
-        }
-        if (!fs.existsSync(livePricesDir)) {
-            fs.mkdirSync(livePricesDir, { recursive: true });
-        }
-
-        const runId = getRunId();
-
-        // Use mode-specific prefix to prevent conflicts between paper and watch modes
-        const modePrefix = ENV.PAPER_MODE ? 'PAPER - ' : '';
-
-        this.btc15mPath = this.findOrCreatePriceFile(livePricesDir, `${modePrefix}BTC`, '15 min', runId);
-        this.eth15mPath = this.findOrCreatePriceFile(livePricesDir, `${modePrefix}ETH`, '15 min', runId);
-        this.btc1hPath = this.findOrCreatePriceFile(livePricesDir, `${modePrefix}BTC`, '1 hour', runId);
-        this.eth1hPath = this.findOrCreatePriceFile(livePricesDir, `${modePrefix}ETH`, '1 hour', runId);
-
-        console.log(`📊 Price Stream Logger initialized in ${ENV.PAPER_MODE ? 'PAPER' : 'WATCH'} mode`);
-
-        this.initializeCsvFiles();
-    }
-
-    private findOrCreatePriceFile(livePricesDir: string, asset: string, timeframe: string, currentRunId: string): string {
-        try {
-            const escapedTimeframe = timeframe.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
-            const pattern = new RegExp(`^${asset} - ${escapedTimeframe} prices_\\d{8}-\\d{6}\\.csv$`);
-
-            const files = fs.readdirSync(livePricesDir)
-                .filter(file => pattern.test(file))
-                .map(file => ({
-                    name: file,
-                    path: path.join(livePricesDir, file),
-                    stats: fs.statSync(path.join(livePricesDir, file))
-                }))
-                .sort((a, b) => b.stats.mtime.getTime() - a.stats.mtime.getTime());
-
-            if (files.length > 0) {
-                console.log(`✓ Reusing existing CSV file: ${files[0].name}`);
-                return files[0].path;
-            }
-        } catch (error) {
-            // Fall through to create new file
-        }
-
-        return path.join(livePricesDir, `${asset} - ${timeframe} prices_${currentRunId}.csv`);
-    }
-
-    private initializeCsvFiles(): void {
-        try {
-            const headers = [
-                'Timestamp',
-                'Date',
-                'Year',
-                'Month',
-                'Day',
-                'Hour',
-                'Minute',
-                'Second',
-                'Millisecond',
-                'Price UP ($)',
-                'Price DOWN ($)',
-                'Watch Mode Entry',
-                'Paper Mode Entry',
-                'Notes'
-            ].join(',');
-
-            const files = [
-                { path: this.btc15mPath, name: 'BTC 15 min' },
-                { path: this.eth15mPath, name: 'ETH 15 min' },
-                { path: this.btc1hPath, name: 'BTC 1 hour' },
-                { path: this.eth1hPath, name: 'ETH 1 hour' }
-            ];
-
-            for (const file of files) {
-                if (!fs.existsSync(file.path)) {
-                    fs.writeFileSync(file.path, headers + '\n', 'utf8');
-                    console.log(`✓ Created CSV file: ${file.path}`);
-                } else {
-                    console.log(`✓ Using existing CSV file: ${file.path}`);
-                }
-            }
-        } catch (error) {
-            console.error(`✗ Failed to initialize price CSV files:`, error);
-        }
-    }
-
-    /**
-     * Get the file path for a market
-     */
-    private getFilePath(type: 'BTC' | 'ETH', timeframe: '15m' | '1h'): string {
-        if (type === 'BTC' && timeframe === '15m') return this.btc15mPath;
-        if (type === 'ETH' && timeframe === '15m') return this.eth15mPath;
-        if (type === 'BTC' && timeframe === '1h') return this.btc1hPath;
-        return this.eth1hPath;
-    }
-
-    /**
-     * Write a single row to CSV
-     */
-    private writeRow(
-        filePath: string,
-        timestamp: number,
-        priceUp: number,
-        priceDown: number,
-        isWatch: boolean,
-        isPaper: boolean,
-        notes?: string
-    ): void {
-        try {
-            const timeBreakdown = getTimestampBreakdown(timestamp);
-            const date = new Date(timestamp).toISOString();
-
-            const notesField = notes ? `"${notes.replace(/"/g, '""')}"` : '';
-
-            const row = [
-                timestamp,
-                date,
-                timeBreakdown.year,
-                timeBreakdown.month,
-                timeBreakdown.day,
-                timeBreakdown.hour,
-                timeBreakdown.minute,
-                timeBreakdown.second,
-                timeBreakdown.millisecond,
-                priceUp.toFixed(4),
-                priceDown.toFixed(4),
-                isWatch ? 'YES' : '',
-                isPaper ? 'YES' : '',
-                notesField,
-            ].join(',');
-
-            fs.appendFileSync(filePath, row + '\n', 'utf8');
-        } catch (error) {
-            console.error(`Failed to write row to ${filePath}:`, error);
-        }
-    }
-
-    /**
-     * Notify that a new market window has started
-     * This enables logging for that market and clears old data tracking
-     * @param type - 'BTC' or 'ETH'
-     * @param timeframe - '15m' or '1h'
-     * @param windowStartTimestamp - Unix timestamp (seconds) of the market window start
-     */
-    notifyNewMarketWindow(type: 'BTC' | 'ETH', timeframe: '15m' | '1h', windowStartTimestamp: number): void {
-        const marketKey = `${type}-${timeframe}`;
-        const currentWindow = this.currentMarketWindow.get(marketKey);
-
-        // Only update if this is a NEW window (different timestamp)
-        if (currentWindow !== windowStartTimestamp) {
-            this.currentMarketWindow.set(marketKey, windowStartTimestamp);
-            this.loggingEnabled.set(marketKey, true);
-
-            // Clear old logged entries for this market to allow fresh logging
-            const prefix = `${type}-${timeframe}`;
-            for (const key of this.loggedTradeEntries) {
-                if (key.includes(prefix)) {
-                    this.loggedTradeEntries.delete(key);
-                }
-            }
-
-            console.log(`📊 Price logging enabled for ${marketKey} (window: ${new Date(windowStartTimestamp * 1000).toISOString()})`);
-        }
-    }
-
-    /**
-     * Check if logging is enabled for a market
-     */
-    isLoggingEnabled(type: 'BTC' | 'ETH', timeframe: '15m' | '1h'): boolean {
-        const marketKey = `${type}-${timeframe}`;
-        return this.loggingEnabled.get(marketKey) || false;
-    }
-
-    /**
-     * Log price update - writes immediately with current timestamp
-     * Called frequently to capture real-time price movements
-     * Only logs if a new market window has been notified
-     */
-    logPrice(marketSlug: string, marketTitle: string, priceUp: number, priceDown: number): void {
-        const { type, timeframe } = extractMarketKey(marketSlug, marketTitle);
-        if (!type || !timeframe) return;
-
-        const marketKey = `${type}-${timeframe}`;
-
-        // Only log if logging is enabled for this market (new window has started)
-        if (!this.loggingEnabled.get(marketKey)) {
-            return;
-        }
-
-        const timestamp = Date.now();
-        const filePath = this.getFilePath(type, timeframe);
-
-        // Only write if timestamp is different from last (avoid duplicate ms rows)
-        const lastTs = this.lastLoggedTimestamp.get(marketKey) || 0;
-        if (timestamp <= lastTs) return;
-
-        this.lastLoggedTimestamp.set(marketKey, timestamp);
-        this.writeRow(filePath, timestamp, priceUp, priceDown, false, false);
-    }
-
-    /**
-     * Mark a watcher trade entry
-     * Uses the EXACT timestamp from the trade and the execution price
-     *
-     * @param marketSlug - Market slug
-     * @param marketTitle - Market title
-     * @param priceUp - The execution price for UP (what watcher paid)
-     * @param priceDown - The execution price for DOWN (derived: 1 - priceUp)
-     * @param notes - Trade details (e.g., "UP 10.0000 shares @ $0.0200")
-     * @param transactionHash - Unique trade identifier
-     * @param tradeTimestamp - EXACT timestamp from the trade (in ms)
-     */
-    markWatchEntry(
-        marketSlug: string,
-        marketTitle: string,
-        priceUp: number,
-        priceDown: number,
-        notes?: string,
-        transactionHash?: string,
-        tradeTimestamp?: number
-    ): void {
-        const { type, timeframe } = extractMarketKey(marketSlug, marketTitle);
-        if (!type || !timeframe) return;
-
-        const marketKey = `${type}-${timeframe}`;
-
-        // Only log if logging is enabled for this market (new window has started)
-        if (!this.loggingEnabled.get(marketKey)) {
-            return;
-        }
-
-        // Prevent duplicate entries
-        const tradeKey = transactionHash
-            ? `WATCH:${transactionHash}`
-            : `WATCH:${type}-${timeframe}:${notes}`;
-
-        if (this.loggedTradeEntries.has(tradeKey)) return;
-        this.loggedTradeEntries.add(tradeKey);
-
-        const filePath = this.getFilePath(type, timeframe);
-
-        // Use the exact trade timestamp if provided, otherwise use now
-        const timestamp = tradeTimestamp || Date.now();
-
-        this.writeRow(
-            filePath,
-            timestamp,
-            priceUp,
-            priceDown,
-            true,  // isWatch
-            false, // isPaper
-            `WATCH: ${notes}`
-        );
-    }
-
-    /**
-     * Mark a paper trade entry
-     */
-    markPaperEntry(
-        marketSlug: string,
-        marketTitle: string,
-        priceUp: number,
-        priceDown: number,
-        notes?: string,
-        transactionHash?: string,
-        tradeTimestamp?: number
-    ): void {
-        const { type, timeframe } = extractMarketKey(marketSlug, marketTitle);
-        if (!type || !timeframe) return;
-
-        const marketKey = `${type}-${timeframe}`;
-
-        // Only log if logging is enabled for this market (new window has started)
-        if (!this.loggingEnabled.get(marketKey)) {
-            return;
-        }
-
-        const tradeKey = transactionHash
-            ? `PAPER:${transactionHash}`
-            : `PAPER:${type}-${timeframe}:${notes}`;
-
-        if (this.loggedTradeEntries.has(tradeKey)) return;
-        this.loggedTradeEntries.add(tradeKey);
-
-        const filePath = this.getFilePath(type, timeframe);
-        const timestamp = tradeTimestamp || Date.now();
-
-        this.writeRow(
-            filePath,
-            timestamp,
-            priceUp,
-            priceDown,
-            false, // isWatch
-            true,  // isPaper
-            `PAPER: ${notes}`
-        );
-    }
-
-    /**
-     * Get current prices (for compatibility)
-     */
-    getCurrentPrices(marketSlug: string, marketTitle: string): { priceUp: number; priceDown: number } | null {
-        return null; // Not tracking state anymore - prices come from orderbook
-    }
-}
-
-export default new PriceStreamLogger();
+export default priceStreamLogger;

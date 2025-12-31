@@ -68,6 +68,18 @@ npm run build
 npm start
 ```
 
+**Mode Selection:** When you start the bot, you'll be prompted to choose:
+- **Paper Mode** - Simulated trading (safe for testing)
+- **Watcher Mode** - Monitor traders only (read-only)
+- **Trading Mode** - Real trading (uses your wallet)
+
+You can also set modes via environment variables:
+```bash
+PAPER_MODE=true npm start        # Paper mode
+TRACK_ONLY_MODE=true npm start   # Watcher mode
+npm start                        # Trading mode (default)
+```
+
 ---
 
 ## Expected Output

@@ -391,11 +391,12 @@ class TradeLogger {
             let prices: { priceUp: number; priceDown: number };
 
             if (activity.marketPriceUp !== undefined && activity.marketPriceDown !== undefined) {
-                // Use actual market prices passed by paper trades
+                // Use actual market prices passed (paper trades or injected live prices from watcher)
                 prices = {
                     priceUp: activity.marketPriceUp,
                     priceDown: activity.marketPriceDown
                 };
+                console.log(`📊 LIVE PRICES: ${marketKey} UP=$${prices.priceUp.toFixed(4)} DOWN=$${prices.priceDown.toFixed(4)} (injected)`);
             } else {
                 // For WATCHER trades: Use prices from marketTracker (already fetched from orderbook)
                 // This is more reliable than fetching again since marketTracker continuously updates prices
@@ -564,8 +565,7 @@ class TradeLogger {
             fs.appendFileSync(this.csvFilePath, row + '\n', 'utf8');
             this.loggedTrades.add(tradeKey);
 
-            // Log to price stream with EXACT timestamp and EXECUTION price
-            // The execution price IS the real orderbook price at the time of the trade
+            // Log to price stream with EXACT timestamp and TRUE API prices
             const marketTitle = activity.title || activity.slug || 'Unknown';
             const entryType = traderAddress === 'PAPER' ? 'PAPER' : 'WATCH';
             const entryNotes = `${outcome} ${size.toFixed(4)} shares @ $${tradePrice.toFixed(4)}`;
@@ -573,10 +573,24 @@ class TradeLogger {
             // Use EXACT trade timestamp (convert from seconds to ms if needed)
             const tradeTimestampMs = timestamp; // Already in ms from line 382
 
-            // For price stream: use the EXACT fetched prices (same as trade CSV)
-            // This gives actual orderbook prices for both UP and DOWN
+            // For price stream: use the ACTUAL API prices (both UP and DOWN fetched from orderbook)
+            // These are injected into the activity by tradeMonitor before calling logTrade
+            // NO calculation - both prices come directly from the CLOB API
             const streamPriceUp = prices.priceUp;
             const streamPriceDown = prices.priceDown;
+
+            // Validate prices are reasonable (skip if not)
+            if (streamPriceUp <= 0 || streamPriceUp >= 1 || streamPriceDown <= 0 || streamPriceDown >= 1) {
+                console.log(`⚠️ Price stream entry skipped: invalid prices UP=$${streamPriceUp.toFixed(4)} DOWN=$${streamPriceDown.toFixed(4)}`);
+                return;
+            }
+
+            // Also validate that prices add up (sanity check)
+            const priceSum = streamPriceUp + streamPriceDown;
+            if (priceSum < 0.90 || priceSum > 1.10) {
+                console.log(`⚠️ Price stream entry skipped: prices don't add up (UP=$${streamPriceUp.toFixed(4)} + DOWN=$${streamPriceDown.toFixed(4)} = $${priceSum.toFixed(4)})`);
+                return;
+            }
 
             if (entryType === 'PAPER') {
                 priceStreamLogger.markPaperEntry(

@@ -331,8 +331,6 @@ export const main = async () => {
             Logger.info('Starting trade executor...');
             tradeExecutor(clobClientForClosing!);
         }
-
-        // test(clobClient);
     } catch (error) {
         Logger.error(`Fatal error during startup: ${error}`);
         await gracefulShutdown('startup-error');

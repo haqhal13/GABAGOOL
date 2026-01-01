@@ -203,32 +203,41 @@ def simulate_policy(tape: pd.DataFrame, trades: pd.DataFrame, params: Dict[str, 
 def compute_validation_metrics(actual_trades: pd.DataFrame, simulated_trades: pd.DataFrame) -> Dict[str, Any]:
     """
     Compute validation metrics comparing actual vs simulated trades.
+    Returns per-market metrics.
     
     Args:
         actual_trades: Actual WATCH trades
         simulated_trades: Simulated trades from policy
         
     Returns:
-        Dictionary with validation metrics
+        Dictionary with per-market validation metrics: {market: {recall, precision, size_mape, ...}}
     """
     actual_watch = actual_trades[actual_trades['bot'] == 'WATCH'].copy()
     
     if len(actual_watch) == 0 or len(simulated_trades) == 0:
         return {'error': 'No trades to compare'}
     
-    metrics = {}
+    per_market_metrics = {}
     
-    # Match trades: for each actual trade, find nearest simulated trade within ±2s
-    matched = []
-    
+    # Compute metrics per market
     for market in actual_watch['market'].unique():
         market_actual = actual_watch[actual_watch['market'] == market].copy()
         market_sim = simulated_trades[simulated_trades['market'] == market].copy()
         
         if len(market_sim) == 0:
+            per_market_metrics[market] = {
+                'recall': 0.0,
+                'precision': 0.0,
+                'side_accuracy': 0.0,
+                'size_mape': 0.0,
+                'matched_count': 0,
+                'actual_count': len(market_actual),
+                'simulated_count': 0
+            }
             continue
         
         market_sim = market_sim.sort_values('Timestamp').reset_index(drop=True)
+        matched = []
         
         for _, actual_trade in market_actual.iterrows():
             actual_ts = actual_trade['Timestamp']
@@ -248,33 +257,76 @@ def compute_validation_metrics(actual_trades: pd.DataFrame, simulated_trades: pd
                     'size_ratio': sim_trade['shares'] / actual_trade['shares'] if actual_trade['shares'] > 0 else 0,
                     'fill_px_diff': abs(actual_trade.get('fill_px', 0) - sim_trade.get('side_px_at_trade', 0))
                 })
+        
+        matched_df = pd.DataFrame(matched)
+        
+        if len(matched_df) > 0:
+            # Recall: how many actual trades were matched
+            recall = len(matched_df) / len(market_actual)
+            
+            # Precision: how many simulated trades matched actual
+            precision = len(matched_df) / len(market_sim) if len(market_sim) > 0 else 0
+            
+            # Side accuracy
+            side_accuracy = matched_df['same_side'].mean() if len(matched_df) > 0 else 0
+            
+            # Size error (MAPE)
+            size_mape = (abs(matched_df['size_ratio'] - 1.0).mean() * 100) if len(matched_df) > 0 else 0
+            
+            per_market_metrics[market] = {
+                'recall': float(recall),
+                'precision': float(precision),
+                'side_accuracy': float(side_accuracy),
+                'size_mape': float(size_mape),
+                'matched_count': len(matched_df),
+                'actual_count': len(market_actual),
+                'simulated_count': len(market_sim)
+            }
+        else:
+            per_market_metrics[market] = {
+                'recall': 0.0,
+                'precision': 0.0,
+                'side_accuracy': 0.0,
+                'size_mape': 0.0,
+                'matched_count': 0,
+                'actual_count': len(market_actual),
+                'simulated_count': len(market_sim)
+            }
     
-    matched_df = pd.DataFrame(matched)
+    # Also compute global metrics for backward compatibility
+    all_matched = []
+    for market in actual_watch['market'].unique():
+        market_actual = actual_watch[actual_watch['market'] == market].copy()
+        market_sim = simulated_trades[simulated_trades['market'] == market].copy()
+        if len(market_sim) == 0:
+            continue
+        market_sim = market_sim.sort_values('Timestamp').reset_index(drop=True)
+        for _, actual_trade in market_actual.iterrows():
+            actual_ts = actual_trade['Timestamp']
+            time_diffs = abs(market_sim['Timestamp'] - actual_ts) / 1000.0
+            within_window = time_diffs <= 2.0
+            if within_window.any():
+                nearest_idx = time_diffs[within_window].idxmin()
+                sim_trade = market_sim.loc[nearest_idx]
+                all_matched.append({
+                    'same_side': actual_trade['side'] == sim_trade['side'],
+                    'size_ratio': sim_trade['shares'] / actual_trade['shares'] if actual_trade['shares'] > 0 else 0,
+                })
     
-    if len(matched_df) > 0:
-        # Recall: how many actual trades were matched
-        recall = len(matched_df) / len(actual_watch)
-        
-        # Precision: how many simulated trades matched actual
-        precision = len(matched_df) / len(simulated_trades) if len(simulated_trades) > 0 else 0
-        
-        # Side accuracy
-        side_accuracy = matched_df['same_side'].mean() if len(matched_df) > 0 else 0
-        
-        # Size error (MAPE)
-        size_mape = (abs(matched_df['size_ratio'] - 1.0).mean() * 100) if len(matched_df) > 0 else 0
-        
-        metrics = {
-            'recall': float(recall),
-            'precision': float(precision),
-            'side_accuracy': float(side_accuracy),
-            'size_mape': float(size_mape),
-            'matched_count': len(matched_df),
+    all_matched_df = pd.DataFrame(all_matched)
+    global_metrics = {}
+    if len(all_matched_df) > 0:
+        global_metrics = {
+            'recall': float(len(all_matched_df) / len(actual_watch)),
+            'precision': float(len(all_matched_df) / len(simulated_trades)) if len(simulated_trades) > 0 else 0,
+            'side_accuracy': float(all_matched_df['same_side'].mean()),
+            'size_mape': float((abs(all_matched_df['size_ratio'] - 1.0).mean() * 100)),
+            'matched_count': len(all_matched_df),
             'actual_count': len(actual_watch),
             'simulated_count': len(simulated_trades)
         }
     else:
-        metrics = {
+        global_metrics = {
             'recall': 0.0,
             'precision': 0.0,
             'side_accuracy': 0.0,
@@ -284,7 +336,10 @@ def compute_validation_metrics(actual_trades: pd.DataFrame, simulated_trades: pd
             'simulated_count': len(simulated_trades)
         }
     
-    return metrics
+    return {
+        'per_market': per_market_metrics,
+        'global': global_metrics
+    }
 
 
 def validate_model(tape: pd.DataFrame, trades: pd.DataFrame, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -294,26 +349,52 @@ def validate_model(tape: pd.DataFrame, trades: pd.DataFrame, params: Dict[str, A
     Args:
         tape: Full price tape dataframe
         trades: Trade rows dataframe
-        params: Inferred parameters
+        params: Inferred parameters (market-first format)
         
     Returns:
         Dictionary with validation results
     """
     print("\n=== Validating Model ===")
     
+    # Convert params to old format for PolicySimulator (it expects param-type-first)
+    params_old_format = {
+        'entry_params': {'per_market': {}},
+        'size_params': {'per_market': {}},
+        'inventory_params': {'per_market': {}},
+        'cadence_params': {'per_market': {}}
+    }
+    for market, market_params in params.items():
+        params_old_format['entry_params']['per_market'][market] = market_params.get('entry_params', {})
+        params_old_format['size_params']['per_market'][market] = market_params.get('size_params', {})
+        params_old_format['inventory_params']['per_market'][market] = market_params.get('inventory_params', {})
+        params_old_format['cadence_params']['per_market'][market] = market_params.get('cadence_params', {})
+    
     # Simulate policy
     print("Simulating policy...")
-    simulated_trades = simulate_policy(tape, trades, params)
+    simulated_trades = simulate_policy(tape, trades, params_old_format)
     print(f"Generated {len(simulated_trades)} simulated trades")
     
     # Compute metrics
     metrics = compute_validation_metrics(trades, simulated_trades)
     
-    print(f"Validation Metrics:")
-    print(f"  Recall: {metrics.get('recall', 0):.2%}")
-    print(f"  Precision: {metrics.get('precision', 0):.2%}")
-    print(f"  Side Accuracy: {metrics.get('side_accuracy', 0):.2%}")
-    print(f"  Size MAPE: {metrics.get('size_mape', 0):.2f}%")
+    # Print per-market validation metrics
+    print("\n=== Per-Market Validation Metrics ===")
+    per_market = metrics.get('per_market', {})
+    for market in sorted(per_market.keys()):
+        m = per_market[market]
+        print(f"\n{market}:")
+        print(f"  entry_precision: {m.get('precision', 0):.2%}")
+        print(f"  entry_recall: {m.get('recall', 0):.2%}")
+        print(f"  size_MAPE: {m.get('size_mape', 0):.2f}%")
+        print(f"  matched_count: {m.get('matched_count', 0)} / {m.get('actual_count', 0)}")
+    
+    # Print global summary
+    global_metrics = metrics.get('global', {})
+    print(f"\n=== Global Validation Summary ===")
+    print(f"  Recall: {global_metrics.get('recall', 0):.2%}")
+    print(f"  Precision: {global_metrics.get('precision', 0):.2%}")
+    print(f"  Side Accuracy: {global_metrics.get('side_accuracy', 0):.2%}")
+    print(f"  Size MAPE: {global_metrics.get('size_mape', 0):.2f}%")
     
     return {
         'metrics': metrics,

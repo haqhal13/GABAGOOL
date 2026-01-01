@@ -23,6 +23,9 @@ import Logger from '../utils/logger';
 import marketTracker from './marketTracker';
 import tradeLogger from './tradeLogger';
 import priceStreamLogger from './priceStreamLogger';
+import { policyIntegrator } from './policyIntegrator';
+import { getParamLoader } from './paramLoader';
+import { policyEngine, TapeState } from './policyEngine';
 
 // Debug log file for paper mode (won't be cleared by screen refresh)
 const debugLogPath = path.join(process.cwd(), 'logs', 'paper_debug.log');
@@ -38,95 +41,52 @@ function debugLog(message: string): void {
 }
 
 // =============================================================================
-// CONFIGURATION - REVERSE ENGINEERED FROM 41,030 WATCHER TRADES
+// CONFIGURATION - PURELY PARAMETER-BASED
+// All trading logic comes from params_latest.json - no hardcoded values
 // =============================================================================
 const PAPER_STARTING_CAPITAL = parseFloat(process.env.PAPER_STARTING_CAPITAL || '10000');
 
-// Per-market allocation (from 57,259 trades: Max $6,793, Avg $3,610 per BTC 15m window)
-// BTC gets more capital (67.3% BTC vs 32.7% ETH)
-const PAPER_BTC_MAX_PER_MARKET = parseFloat(process.env.PAPER_BTC_MAX_PER_MARKET || '3600');
-const PAPER_ETH_MAX_PER_MARKET = parseFloat(process.env.PAPER_ETH_MAX_PER_MARKET || '2400');
+// REMOVED: All hardcoded share distributions, timing patterns, biases, etc.
+// These are now handled by parameters:
+// - size_params: Share sizes per price bucket
+// - cadence_params: Timing between trades
+// - inventory_params: Position limits
+// - entry_params: Entry conditions
 
-// =============================================================================
-// THE SECRET SAUCE: EXACT WATCHER SHARE DISTRIBUTIONS (Dec 29 - 2,752 trades!)
-// KEY INSIGHT: 25 shares is #1 at 21.7%! followed by 5 shares at 12.4%!
-// BTC 15m: 25(21.7%), 5(12.4%), 2(7.1%), 24(6.3%), 1(4.8%), 15(4.0%), 10(3.9%)
-// Average share size: 13.91, Range: 0.01 - 25.00
-// UP/DOWN bias: 49.4% UP / 50.6% DOWN (nearly perfect 50/50)
-// =============================================================================
-// BTC 15-min share distribution (2,752 trades analyzed - Dec 29)
-// 25 shares dominates at 21.7%, followed by 5 shares at 12.4%
-const BTC_15M_SHARE_AMOUNTS = [25, 5, 2, 24, 1, 15, 10, 3, 23, 22, 6, 12, 4, 7, 14];
-const BTC_15M_SHARE_WEIGHTS = [21.7, 12.4, 7.1, 6.3, 4.8, 4.0, 3.9, 3.7, 3.6, 3.2, 3.0, 2.8, 2.6, 2.5, 2.4];
-
-// ETH 15-min share distribution (using same as BTC for now - both follow similar patterns)
-const ETH_15M_SHARE_AMOUNTS = [25, 5, 2, 24, 1, 15, 10, 3, 23, 22, 6, 12];
-const ETH_15M_SHARE_WEIGHTS = [21.7, 12.4, 7.1, 6.3, 4.8, 4.0, 3.9, 3.7, 3.6, 3.2, 3.0, 2.8];
-
-// 1-hour market share distribution (BTC 6,354 trades, ETH 5,209 trades)
-// BTC 1h: 16 shares dominates at 24%, ETH 1h: 10 shares dominates at 41.4%
-const BTC_1H_SHARE_AMOUNTS = [16, 15, 5, 12, 10, 14, 9, 11, 2, 1];
-const BTC_1H_SHARE_WEIGHTS = [24.0, 9.5, 8.7, 6.9, 6.5, 6.3, 4.7, 4.2, 4.2, 3.7];
-
-const ETH_1H_SHARE_AMOUNTS = [10, 9, 5, 7, 6, 8, 1, 2, 3];
-const ETH_1H_SHARE_WEIGHTS = [41.4, 16.5, 7.4, 7.0, 5.3, 5.1, 4.3, 4.3, 3.5];
-
-// Legacy fallback
-const TARGET_SHARE_AMOUNTS = BTC_15M_SHARE_AMOUNTS;
-const SHARE_WEIGHTS = BTC_15M_SHARE_WEIGHTS;
-const MIN_SHARES = 0.5;
-
-// =============================================================================
-// TIMING PATTERNS (from Dec 29 - 3,018 trades deep analysis)
-// Gap distribution: 61% at 2-3s, 14% at 3-5s, 15% at 5-10s, 9% at 10-30s
-// Avg gap: 4.65s, Median gap: 2s
-// Avg trades per active minute: 34 trades
-// =============================================================================
-const BATCH_INTERVAL_MS = 2000; // Median gap (61% of trades at 2-3s)
-const BASE_GAP_MS = 2000; // Base gap between individual trades
+// Only keep essential constants for system operation
 const POLL_INTERVAL_MS = 1; // Poll interval - maximum speed
-
-// SEQUENCE PATTERN: 71.4% of trades follow same side as previous!
-// Avg streak length: 3.49 trades of same side in a row
-const SAME_SIDE_PROBABILITY = 0.714; // 71.4% chance to repeat same side
-const AVG_STREAK_LENGTH = 3.5; // Average trades before switching sides
-
-// Direction balance: Pure 50/50 strategy (watcher shows 49.4/50.6 - essentially 50/50)
-const BTC_UP_BIAS = 0.50; // Pure 50/50
-const ETH_UP_BIAS = 0.50; // Pure 50/50
-const UP_BIAS = 0.50; // Pure 50/50
-const DIRECTION_VARIANCE = 0.0; // No variance - strict 50/50
-
-// BTC vs ETH allocation: 67.3% BTC, 32.7% ETH (from 57,259 trades)
-const BTC_ALLOCATION_RATIO = 0.673;
-
-// =============================================================================
-// MOMENTUM CHASING - ANALYSIS SHOWS NO MOMENTUM BIAS!
-// Dec 26 data: When priceUp 0.30-0.60, watcher buys 49-51% UP consistently
-// This means NO momentum chasing - just pure 50/50 hedging strategy
-// Keeping these params but setting to 0 to disable
-// =============================================================================
-const MOMENTUM_CHASE_FACTOR = 0.0; // DISABLED - no momentum chasing
-const PRICE_THRESHOLD_FOR_CHASE = 0.10; // Not used when factor is 0
-const REBALANCE_CHECK_INTERVAL_MS = 10000; // Not used when factor is 0
-
-// Arbitrage strategy parameters
-const EXPIRATION_WINDOW_MS = 2 * 60 * 1000;
-const CLEAR_OUTCOME_THRESHOLD = 0.95;
-const MAX_LOSER_PRICE = 0.05;
-const MIN_LOSER_PRICE = 0.001;
-const SKIP_UNCLEAR_THRESHOLD = 0.70;
-
-// Legacy (unused but kept for env var compatibility)
-const PAPER_MIN_TRADE = parseFloat(process.env.PAPER_MIN_TRADE || '0.50');
-const PAPER_MEDIAN_TRADE = parseFloat(process.env.PAPER_MEDIAN_TRADE || '6');
-const PAPER_MAX_TRADE = parseFloat(process.env.PAPER_MAX_TRADE || '15');
+const EXPIRATION_WINDOW_MS = 2 * 60 * 1000; // Stop trading 2 min before expiration (safety)
 
 const USER_ADDRESSES = ENV.USER_ADDRESSES;
 const FETCH_INTERVAL = ENV.FETCH_INTERVAL;
 
 if (!USER_ADDRESSES || USER_ADDRESSES.length === 0) {
     throw new Error('USER_ADDRESSES is not defined or empty');
+}
+
+// Initialize parameter loader for policy-based trading
+const paramsPath = path.join(process.cwd(), 'watch_bot_analyzer', 'output', 'params_latest.json');
+const paramLoader = getParamLoader(paramsPath);
+paramLoader.startHotReload(3000); // Reload params every 3 seconds
+Logger.info(`📊 Policy parameters loaded from: ${paramsPath}`);
+Logger.info(`🔄 Hot-reload enabled: parameters will update automatically when regenerated`);
+
+/**
+ * Convert market key (e.g., "BTC-UpDown-15") to parameter format (e.g., "BTC_15m")
+ */
+function getParamMarketKey(marketKey: string): string {
+    const isBTC = marketKey.includes('BTC') || marketKey.toLowerCase().includes('bitcoin');
+    const isETH = marketKey.includes('ETH') || marketKey.toLowerCase().includes('ethereum');
+    const is15m = marketKey.includes('-15') || marketKey.includes('15m') || marketKey.includes('15-min');
+    const is1h = marketKey.includes('-1h') || marketKey.includes('1h') || marketKey.includes('1-hour') || marketKey.includes('hourly');
+    
+    if (isBTC && is15m) return 'BTC_15m';
+    if (isETH && is15m) return 'ETH_15m';
+    if (isBTC && is1h) return 'BTC_1h';
+    if (isETH && is1h) return 'ETH_1h';
+    
+    // Fallback to BTC_15m if can't determine
+    return 'BTC_15m';
 }
 
 // Create activity models for each user
@@ -1338,14 +1298,18 @@ async function updatePrices(): Promise<void> {
                 return;
             }
 
-            const [priceUp, priceDown] = await Promise.all([
-                getOrderBookPrice(assetUpToUse),
-                getOrderBookPrice(assetDownToUse)
-            ]);
+            // CRITICAL: Use ASK prices (execution prices) from order book, not mid-market
+            // This ensures 15m markets adjust to actual order book prices (what we'd pay to buy)
+            // Mid-market prices don't reflect real execution costs
+            const orderBookPrices = await getOrderBookExecutionPrices(assetUpToUse, assetDownToUse);
+            const priceUp = orderBookPrices.execPriceUp || orderBookPrices.midPriceUp || null;
+            const priceDown = orderBookPrices.execPriceDown || orderBookPrices.midPriceDown || null;
 
             // DEBUG: Log price updates per market to detect mixing
             if (priceUp !== null && priceDown !== null) {
-                debugLog(`💰 PRICE UPDATE ${market.marketKey}: UP=$${priceUp.toFixed(4)} DOWN=$${priceDown.toFixed(4)} | AssetUp=${assetUpToUse?.slice(0,12)}... AssetDown=${assetDownToUse?.slice(0,12)}... (from tracker: ${trackerMarket ? 'YES' : 'NO'})`);
+                const is15m = market.marketKey.includes('-15');
+                const priceType = orderBookPrices.execPriceUp ? 'ASK' : 'MID';
+                debugLog(`💰 PRICE UPDATE ${market.marketKey} (${is15m ? '15m' : '1h'}): UP=$${priceUp.toFixed(4)} DOWN=$${priceDown.toFixed(4)} [${priceType}] | AssetUp=${assetUpToUse?.slice(0,12)}... AssetDown=${assetDownToUse?.slice(0,12)}... (from tracker: ${trackerMarket ? 'YES' : 'NO'})`);
             } else if (priceUp === null || priceDown === null) {
                 // If API returns null, market may be expired - mark for cleanup
                 debugLog(`⚠️ PRICE NULL ${market.marketKey}: UP=${priceUp} DOWN=${priceDown} - market may be expired`);
@@ -1355,6 +1319,12 @@ async function updatePrices(): Promise<void> {
             if (priceUp !== null) market.priceUp = priceUp;
             if (priceDown !== null) market.priceDown = priceDown;
             market.lastUpdate = now;
+            
+            // Update price history in policy integrator for feature computation
+            if (priceUp !== null && priceDown !== null) {
+                const paramMarketKey = getParamMarketKey(market.marketKey);
+                policyIntegrator.updatePriceHistory(paramMarketKey, now, priceUp, priceDown);
+            }
 
             // Update paper mode's asset IDs to match marketTracker (if different)
             if (trackerMarket) {
@@ -1464,17 +1434,10 @@ async function buildPositionIncrementally(market: typeof discoveredMarkets exten
     }
 
     // ==========================================================================
-    // WATCHER PATTERN: Trade ONLY in NEUTRAL zone (0.40-0.60)
-    // Data shows: 100% of watcher trades happen when prices are 0.40-0.60
-    // Watcher catches markets RIGHT when they open at 50/50
-    // At extremes, the arbitrage opportunity is GONE - don't trade!
+    // REMOVED: Hardcoded neutral zone filter (0.35-0.65)
+    // This was blocking trades that parameters allow (0.01-0.995)
+    // Now using entry_params price bands from parameters instead
     // ==========================================================================
-    const isNeutral = market.priceUp >= 0.35 && market.priceUp <= 0.65;
-
-    // ONLY trade in neutral zone - skip ALL extreme price trades
-    if (!isNeutral) {
-        return; // Don't trade when prices have moved too far from 50/50
-    }
 
     // Check time to expiration - stop building 2 min before expiration
     if (market.endDate && market.endDate > 0) {
@@ -1510,294 +1473,198 @@ async function buildPositionIncrementally(market: typeof discoveredMarkets exten
 
     if (!buildState) {
         // =======================================================================
-        // POSITION INITIALIZATION - Matches watcher's per-market allocation
-        // Dec 27-28 DATA (57,259 trades):
-        // - 15m markets: 45,696 trades (79.8%) - HEAVY FOCUS!
-        // - 1h markets: 11,563 trades (20.2%)
-        // - BTC 15m: 32,166 (56.2%), ETH 15m: 13,530 (23.6%)
-        // - BTC 1h: 6,354 (11.1%), ETH 1h: 5,209 (9.1%)
+        // POSITION INITIALIZATION - Use inventory_params from parameters
+        // No hardcoded targets - inventory_params.max_*_shares handle limits
         // =======================================================================
-        const isBTC = market.marketKey.includes('BTC');
-        const is15m = market.marketKey.includes('15') || market.marketKey.includes('15m');
-        const is1h = market.marketKey.includes('1h') || market.marketKey.includes('1h-');
-
-        // Base max per market - 15m gets MUCH more than 1h
-        // WATCHER DATA (last 30 mins): 15m = 3023 trades (90.8%), 1h = 305 trades (9.2%)
-        // Ratio: 15m gets 10x more trades than 1h!
-        let maxPerMarket: number;
-        if (is15m) {
-            maxPerMarket = isBTC ? PAPER_BTC_MAX_PER_MARKET : PAPER_ETH_MAX_PER_MARKET;
-        } else {
-            // 1h markets get only 5% of 15m allocation (watcher does 10x more on 15m!)
-            maxPerMarket = (isBTC ? PAPER_BTC_MAX_PER_MARKET : PAPER_ETH_MAX_PER_MARKET) * 0.05;
-        }
-
-        // Watcher invests 2x more in BTC than ETH
-        // BTC gets 75% of capital, ETH gets 50%
-        const capitalRatio = isBTC ? 0.75 : 0.50;
-        const positionSize = Math.min(maxPerMarket, currentCapital * capitalRatio);
-
-        if (positionSize < 10) { // Minimum $10 per position
+        const paramMarketKey = getParamMarketKey(market.marketKey);
+        const marketParams = paramLoader.getMarketParams(market.marketKey);
+        
+        // If no parameters, can't initialize position
+        if (!marketParams.inventory_params) {
+            debugLog(`buildPosition: ${market.marketKey} - Cannot initialize (no inventory_params)`);
             return;
         }
 
-        // WATCHER PATTERN: BTC 50.9% UP, ETH 49.9% UP (from 57,259 trades)
-        const sessionVariance = (Math.random() - 0.5) * 2 * DIRECTION_VARIANCE;
-        const baseUpBias = isBTC ? BTC_UP_BIAS : ETH_UP_BIAS;
-        const upRatio = Math.max(0.48, Math.min(0.52, baseUpBias + sessionVariance));
-        const downRatio = 1 - upRatio;
-
+        // Initialize with zero targets - inventory_params will control position size
         buildState = {
             marketKey: market.marketKey,
-            targetUp: positionSize * upRatio,
-            targetDown: positionSize * downRatio,
+            targetUp: 0,  // No hardcoded targets - inventory_params handles limits
+            targetDown: 0,
             investedUp: 0,
             investedDown: 0,
             lastTradeTime: 0,
-            nextTradeTime: now, // Trade immediately on first iteration
+            nextTradeTime: now, // Not used anymore, but kept for compatibility
             tradeCount: 0,
-            tradeCountUp: 0,   // Track UP trades separately
-            tradeCountDown: 0, // Track DOWN trades separately
+            tradeCountUp: 0,
+            tradeCountDown: 0,
             avgPriceUp: 0,
             avgPriceDown: 0,
-            // DYNAMIC REBALANCING - capture initial prices for momentum tracking
             initialPriceUp: market.priceUp,
             initialPriceDown: market.priceDown,
             lastRebalanceTime: now,
-            momentumBias: 0, // Start neutral
-            // SEQUENCE PATTERN - 71.4% same side follows previous
-            lastTradeSide: null, // No previous trade yet
+            momentumBias: 0,
+            lastTradeSide: null,
             currentStreakLength: 0,
         };
         buildingPositions.set(positionKey, buildState);
 
-        debugLog(`buildPosition: STARTED building ${market.marketKey} - target UP: $${buildState.targetUp.toFixed(2)}, DOWN: $${buildState.targetDown.toFixed(2)}`);
-        debugLog(`📈 Building position: ${market.marketKey} | Target: UP $${buildState.targetUp.toFixed(2)} / DOWN $${buildState.targetDown.toFixed(2)}`);
+        debugLog(`buildPosition: STARTED ${market.marketKey} - Using inventory_params limits (max_up: ${marketParams.inventory_params.max_up_shares}, max_down: ${marketParams.inventory_params.max_down_shares})`);
     }
 
     // ==========================================================================
-    // TIMING PATTERN (from watcher analysis)
-    // Gap between batches: 42% are 2-5s, 28% are 5-10s, 17% are 10-20s
-    // nextTradeTime is set AFTER each trade to ensure consistent gaps
+    // TIMING: Use cadence_params from parameters, not hardcoded gaps!
+    // Parameters show min_inter_trade_ms: 0.0, so cadence check handles timing
+    // REMOVED: Hardcoded nextTradeTime check - cadence_params handles this
     // ==========================================================================
-    if (now < buildState.nextTradeTime) {
-        return; // Wait until next trade time
-    }
-
-    // Check if position is complete
-    const upComplete = buildState.investedUp >= buildState.targetUp * 0.98;
-    const downComplete = buildState.investedDown >= buildState.targetDown * 0.98;
+    // Note: Cadence is checked later in the policy flow, not here
 
     // ==========================================================================
-    // 1H MARKET RATE LIMITING
-    // Watcher: 64% on 15m, 36% on 1h (from Dec 28 data)
-    // Only skip 30% of 1h market trade opportunities
+    // REMOVED: All hardcoded target/position logic
+    // inventory_params handles ALL position limits (max_up_shares, max_down_shares, max_total_shares)
+    // No hardcoded targets, no hardcoded growth, no hardcoded completion checks
     // ==========================================================================
-    const is1hMarket = market.marketKey.includes('-1h');
-    if (is1hMarket && Math.random() < 0.30) {
-        return; // Skip 30% of 1h trades
-    }
-
-    // Keep trading like the watcher - but LIMIT 1h market growth
-    if (upComplete && downComplete) {
-        if (is1hMarket) {
-            // 1h markets: DON'T grow - just stop when complete
-            return; // Stop trading this 1h market when targets reached
-        } else {
-            // 15m markets: keep growing like watcher
-            buildState.targetUp *= 1.1;
-            buildState.targetDown *= 1.1;
-        }
-        debugLog(`buildPosition: ${market.marketKey} targets increased to UP:$${buildState.targetUp.toFixed(2)} DOWN:$${buildState.targetDown.toFixed(2)}`);
-    }
 
     // ==========================================================================
-    // THE SECRET SAUCE: MARKET-SPECIFIC SHARE DISTRIBUTIONS!
-    // BTC and ETH have VERY different share patterns:
-    // - BTC 15m: 28(12.8%), 5(11.7%), 1(10.4%) - larger trades
-    // - ETH 15m: 16(45.6%!), 15(9.5%), 14(5.7%) - focused on 14-16 shares
-    // - 1h markets: 22(19%), 2(18.6%) - polarized
+    // POLICY-BASED TRADING: Use inferred parameters from params_latest.json
+    // This replaces hardcoded logic with data-driven decisions
+    // IMPORTANT: Check both UP and DOWN sides separately (watcher trades both!)
     // ==========================================================================
-    function selectTargetShares(): number {
-        // Select distribution based on market type
-        let shareAmounts: number[];
-        let shareWeights: number[];
-
-        const isBTC = market.marketKey.includes('BTC');
-        const is15m = market.marketKey.includes('-15');
-        const is1h = market.marketKey.includes('-1h');
-
-        if (isBTC && is15m) {
-            shareAmounts = BTC_15M_SHARE_AMOUNTS;
-            shareWeights = BTC_15M_SHARE_WEIGHTS;
-        } else if (!isBTC && is15m) {
-            // ETH 15-min - 12 shares is #1 at 26.6%!
-            shareAmounts = ETH_15M_SHARE_AMOUNTS;
-            shareWeights = ETH_15M_SHARE_WEIGHTS;
-        } else if (isBTC && is1h) {
-            // BTC 1-hour - 22 shares is #1
-            shareAmounts = BTC_1H_SHARE_AMOUNTS;
-            shareWeights = BTC_1H_SHARE_WEIGHTS;
-        } else if (!isBTC && is1h) {
-            // ETH 1-hour - 12 shares is #1
-            shareAmounts = ETH_1H_SHARE_AMOUNTS;
-            shareWeights = ETH_1H_SHARE_WEIGHTS;
-        } else {
-            // Fallback to BTC 15m
-            shareAmounts = BTC_15M_SHARE_AMOUNTS;
-            shareWeights = BTC_15M_SHARE_WEIGHTS;
-        }
-
-        // Weighted random selection
-        const totalWeight = shareWeights.reduce((a, b) => a + b, 0);
-        let rand = Math.random() * totalWeight;
-        for (let i = 0; i < shareAmounts.length; i++) {
-            rand -= shareWeights[i];
-            if (rand <= 0) {
-                // Add small variance (±5%) to avoid exact matches
-                const variance = 0.95 + Math.random() * 0.1;
-                return shareAmounts[i] * variance;
-            }
-        }
-        return 12; // Default fallback
-    }
-
-    // ==========================================================================
-    // DYNAMIC REBALANCING - Check for momentum and adjust bias
-    // Watcher CHASES momentum: when UP price rises, he shifts allocation to UP
-    // This is the real secret sauce - not static 50/50, but dynamic adjustment!
-    // ==========================================================================
-    if (now - buildState.lastRebalanceTime >= REBALANCE_CHECK_INTERVAL_MS) {
-        const priceChangeUp = market.priceUp - buildState.initialPriceUp;
-        const priceChangeDown = market.priceDown - buildState.initialPriceDown;
-
-        // Calculate momentum: positive = UP is winning, negative = DOWN is winning
-        // Watcher shifts 60% of allocation to winning side when price moves 10+ cents
-        if (Math.abs(priceChangeUp) >= PRICE_THRESHOLD_FOR_CHASE) {
-            // UP price moved significantly
-            if (priceChangeUp > 0) {
-                // UP is winning - shift bias toward UP (chase momentum)
-                buildState.momentumBias = Math.min(1, priceChangeUp * MOMENTUM_CHASE_FACTOR * 2);
-                debugLog(`MOMENTUM: ${market.marketKey} UP winning (+${priceChangeUp.toFixed(3)}) → bias ${buildState.momentumBias.toFixed(2)}`);
-            } else {
-                // UP price dropped = DOWN is winning - shift bias toward DOWN
-                buildState.momentumBias = Math.max(-1, priceChangeUp * MOMENTUM_CHASE_FACTOR * 2);
-                debugLog(`MOMENTUM: ${market.marketKey} DOWN winning (UP ${priceChangeUp.toFixed(3)}) → bias ${buildState.momentumBias.toFixed(2)}`);
-            }
-        }
-        buildState.lastRebalanceTime = now;
-    }
-
-    // ==========================================================================
-    // BATCH PATTERN: 32% trade both sides, 68% single side
-    // When trading single side: balance UP/DOWN but CHASE MOMENTUM
-    // ==========================================================================
-    const upProgress = buildState.investedUp / buildState.targetUp;
-    const downProgress = buildState.investedDown / buildState.targetDown;
+    const paramMarketKey = getParamMarketKey(market.marketKey);
+    const marketParams = paramLoader.getMarketParams(market.marketKey);
 
     let sharesUp = 0;
     let sharesDown = 0;
     let tradeUp = 0;
     let tradeDown = 0;
 
-    const tradeBothSides = Math.random() < 0.32; // 32% chance like watcher
-
-    if (!upComplete && !downComplete) {
-        if (tradeBothSides) {
-            // Trade BOTH sides in same batch
-            // But WEIGHT the sides based on momentum!
-            sharesUp = selectTargetShares();
-            sharesDown = selectTargetShares();
-
-            // Apply momentum bias to shares (not value)
-            // Positive bias = more UP shares, negative = more DOWN shares
-            if (buildState.momentumBias > 0.1) {
-                // Chasing UP - increase UP shares, decrease DOWN shares
-                sharesUp *= (1 + buildState.momentumBias * 0.3);
-                sharesDown *= (1 - buildState.momentumBias * 0.2);
-            } else if (buildState.momentumBias < -0.1) {
-                // Chasing DOWN - increase DOWN shares, decrease UP shares
-                sharesDown *= (1 + Math.abs(buildState.momentumBias) * 0.3);
-                sharesUp *= (1 - Math.abs(buildState.momentumBias) * 0.2);
+    // DEBUG: Log what parameters we got
+    debugLog(`[Param Load] ${market.marketKey} -> ${paramMarketKey} (1h=${market.marketKey.includes('-1h')}): entry=${!!marketParams.entry_params}, size=${!!marketParams.size_params}, inv=${!!marketParams.inventory_params}, cadence=${!!marketParams.cadence_params}`);
+    
+    // Special debug for 1h markets
+    if (market.marketKey.includes('-1h')) {
+        debugLog(`[1h Market] ${market.marketKey}: Checking if should trade...`);
+    }
+    
+    // Check if we have policy parameters
+    if (marketParams.entry_params && marketParams.size_params) {
+            // Update price history first (policy integrator needs this for features)
+            policyIntegrator.updatePriceHistory(paramMarketKey, now, market.priceUp || 0.5, market.priceDown || 0.5);
+            
+            // Create tape state for policy engine
+            const tapeState: TapeState = {
+                timestamp: now,
+                up_px: market.priceUp || 0.5,
+                down_px: market.priceDown || 0.5,
+                market: paramMarketKey
+            };
+            
+            // Get price history from policy integrator (for feature computation)
+            const priceHistory = policyIntegrator.getPriceHistory(paramMarketKey);
+            
+            // Compute features (deltas, volatility, etc. from price history)
+            const features = policyEngine.computeFeatures(tapeState, priceHistory);
+            
+            // DEBUG: Log parameter check
+            debugLog(`[Policy Check] ${market.marketKey} (${paramMarketKey}): UP=${market.priceUp?.toFixed(3)}, DOWN=${market.priceDown?.toFixed(3)} | entry_params=${!!marketParams.entry_params}, size_params=${!!marketParams.size_params}, cadence_params=${!!marketParams.cadence_params}`);
+            
+            // Check cadence first
+            const cadenceInfo = policyIntegrator.getCadenceInfo(paramMarketKey);
+            const cadenceOk = policyEngine.cadenceOk(cadenceInfo.lastTradeTime, cadenceInfo.recentTradeTimes, marketParams.cadence_params, now);
+            
+            if (!cadenceOk) {
+                debugLog(`[Policy] ${market.marketKey}: Cadence blocked (lastTrade=${cadenceInfo.lastTradeTime}, recent=${cadenceInfo.recentTradeTimes.length})`);
+                return;
             }
-
-            tradeUp = sharesUp * market.priceUp;
-            tradeDown = sharesDown * market.priceDown;
-        } else {
-            // ==========================================================
-            // SEQUENCE PATTERN: 71.4% of trades follow same side!
-            // Watcher trades in STREAKS - avg 3.5 trades of same side
-            // ==========================================================
-            let preferUp: boolean;
-
-            if (buildState.lastTradeSide === null) {
-                // First trade - use contrarian bias based on price
-                // When UP is cheap (<$0.40), buy UP 64% of time
-                // When DOWN is cheap (<$0.40), buy DOWN 64% of time
-                if (market.priceUp < 0.40) {
-                    preferUp = Math.random() < 0.64; // Buy cheap UP
-                } else if (market.priceDown < 0.40) {
-                    preferUp = Math.random() < 0.36; // Buy cheap DOWN (64% DOWN)
-                } else {
-                    preferUp = Math.random() < 0.50; // Neutral 50/50
-                }
+        
+        // Get order book prices for rebalancing (to determine winning side based on PnL)
+        // Fetch actual ASK prices (execution prices) - these are what we'd pay to buy
+        const orderBookPrices = await getOrderBookExecutionPrices(market.assetUp, market.assetDown);
+        const execPriceUp = orderBookPrices.execPriceUp || market.priceUp || 0.5;
+        const execPriceDown = orderBookPrices.execPriceDown || market.priceDown || 0.5;
+        
+        // Get average entry prices from build state or inventory
+        const buildState = buildingPositions.get(positionKey);
+        const inventoryState = policyIntegrator.getInventoryState(paramMarketKey);
+        const avgCostUp = buildState?.avgPriceUp || inventoryState.avg_cost_up || 0;
+        const avgCostDown = buildState?.avgPriceDown || inventoryState.avg_cost_down || 0;
+        
+        // Check UP side independently (using checkSideEntry to avoid UP-first bias)
+        // REMOVED: !upComplete check - let policy's inventory limits handle position sizing
+        const upEntrySignal = policyEngine.checkSideEntry(tapeState, features, marketParams.entry_params, 'UP');
+        debugLog(`[Policy UP Check] ${market.marketKey}: should_trade=${upEntrySignal.should_trade}, reason="${upEntrySignal.reason}", price=${market.priceUp?.toFixed(3)} (min=${marketParams.entry_params.up_price_min}, max=${marketParams.entry_params.up_price_max})`);
+        
+        if (upEntrySignal.should_trade && upEntrySignal.side === 'UP') {
+            const upShares = policyEngine.sizeForTrade(tapeState, features, marketParams.size_params, 'UP');
+            // Pass order book prices and avg costs to determine winning side
+            const upFinalSide = policyEngine.inventoryOkAndRebalance(
+                inventoryState, 
+                marketParams.inventory_params, 
+                'UP',
+                execPriceUp,  // Current order book ASK price (execution price)
+                execPriceDown,
+                avgCostUp,   // Average entry price
+                avgCostDown
+            );
+            
+            debugLog(`[Policy UP] ${market.marketKey}: shares=${upShares.toFixed(4)}, finalSide=${upFinalSide}, inventory=(${inventoryState.inv_up_shares} UP, ${inventoryState.inv_down_shares} DOWN), execPrice=${execPriceUp.toFixed(4)}, avgCost=${avgCostUp.toFixed(4)}`);
+            
+            if (upFinalSide === 'UP' && upShares > 0) {
+                sharesUp = upShares;
+                tradeUp = sharesUp * execPriceUp; // Use execution price for trade value
+                debugLog(`[Policy UP] ${market.marketKey}: ✅ TRADING ${upShares.toFixed(4)} shares (${upEntrySignal.reason})`);
             } else {
-                // SEQUENCE PATTERN: 71.4% chance to repeat same side
-                const repeatSameSide = Math.random() < SAME_SIDE_PROBABILITY;
-
-                if (repeatSameSide) {
-                    // Continue the streak
-                    preferUp = buildState.lastTradeSide === 'UP';
-                } else {
-                    // Switch sides - apply contrarian bias
-                    if (market.priceUp < 0.40) {
-                        preferUp = true; // Buy cheap UP
-                    } else if (market.priceDown < 0.40) {
-                        preferUp = false; // Buy cheap DOWN
-                    } else {
-                        // Neutral - just flip from previous
-                        preferUp = buildState.lastTradeSide === 'DOWN';
-                    }
-                }
-            }
-
-            // Also consider progress (catch up if WAY behind - >15% difference)
-            if (Math.abs(upProgress - downProgress) >= 0.15) {
-                if (upProgress < downProgress) {
-                    preferUp = true; // Must catch up UP
-                } else {
-                    preferUp = false; // Must catch up DOWN
-                }
-            }
-
-            if (preferUp) {
-                sharesUp = selectTargetShares();
-                tradeUp = sharesUp * market.priceUp;
-            } else {
-                sharesDown = selectTargetShares();
-                tradeDown = sharesDown * market.priceDown;
+                debugLog(`[Policy UP] ${market.marketKey}: ❌ Blocked (finalSide=${upFinalSide}, shares=${upShares})`);
             }
         }
-    } else if (!upComplete) {
-        sharesUp = selectTargetShares();
-        tradeUp = sharesUp * market.priceUp;
-    } else if (!downComplete) {
-        sharesDown = selectTargetShares();
-        tradeDown = sharesDown * market.priceDown;
+        
+        // Check DOWN side independently (CRITICAL: Check both sides separately!)
+        // REMOVED: !downComplete check - let policy's inventory limits handle position sizing
+        const downEntrySignal = policyEngine.checkSideEntry(tapeState, features, marketParams.entry_params, 'DOWN');
+        debugLog(`[Policy DOWN Check] ${market.marketKey}: should_trade=${downEntrySignal.should_trade}, reason="${downEntrySignal.reason}", price=${market.priceDown?.toFixed(3)} (min=${marketParams.entry_params.down_price_min}, max=${marketParams.entry_params.down_price_max})`);
+        
+        if (downEntrySignal.should_trade && downEntrySignal.side === 'DOWN') {
+            const downShares = policyEngine.sizeForTrade(tapeState, features, marketParams.size_params, 'DOWN');
+            // Pass order book prices and avg costs to determine winning side
+            const downFinalSide = policyEngine.inventoryOkAndRebalance(
+                inventoryState, 
+                marketParams.inventory_params, 
+                'DOWN',
+                execPriceUp,  // Current order book ASK price (execution price)
+                execPriceDown,
+                avgCostUp,   // Average entry price
+                avgCostDown
+            );
+            
+            debugLog(`[Policy DOWN] ${market.marketKey}: shares=${downShares.toFixed(4)}, finalSide=${downFinalSide}, inventory=(${inventoryState.inv_up_shares} UP, ${inventoryState.inv_down_shares} DOWN)`);
+            
+            if (downFinalSide === 'DOWN' && downShares > 0) {
+                sharesDown = downShares;
+                tradeDown = sharesDown * market.priceDown;
+                debugLog(`[Policy DOWN] ${market.marketKey}: ✅ TRADING ${downShares.toFixed(4)} shares (${downEntrySignal.reason})`);
+            } else {
+                debugLog(`[Policy DOWN] ${market.marketKey}: ❌ Blocked (finalSide=${downFinalSide}, shares=${downShares})`);
+            }
+        }
+        
+        // If neither side should trade according to policy, return
+        if (sharesUp === 0 && sharesDown === 0) {
+            debugLog(`[Policy] ${market.marketKey}: ❌ No trade (entry rules not met or inventory blocked)`);
+            return;
+        }
+    } else {
+        // NO PARAMS = NO TRADING
+        // Parameters are required - no fallback hardcoded logic
+        debugLog(`[NO PARAMS] ${market.marketKey} (${paramMarketKey}): Missing required parameters! entry_params=${!!marketParams.entry_params}, size_params=${!!marketParams.size_params}`);
+        debugLog(`[NO PARAMS] Available markets in params: ${Object.keys(paramLoader.getParams()).filter(k => !['entry_params', 'size_params', 'inventory_params', 'cadence_params'].includes(k)).join(', ')}`);
+        debugLog(`[NO PARAMS] Cannot trade without parameters - skipping ${market.marketKey}`);
+        return; // Don't trade if no parameters
     }
 
-    // Cap trades to remaining targets and available capital
-    const remainingUp = buildState.targetUp - buildState.investedUp;
-    const remainingDown = buildState.targetDown - buildState.investedDown;
-
-    if (tradeUp > remainingUp) {
-        tradeUp = remainingUp;
-        sharesUp = tradeUp / market.priceUp;
-    }
-    if (tradeDown > remainingDown) {
-        tradeDown = remainingDown;
-        sharesDown = tradeDown / market.priceDown;
-    }
+    // REMOVED: Capping trades to remaining targets
+    // Policy's inventory_params (max_up_shares, max_down_shares) will handle position limits
+    // This allows continuous trading like watcher does, not limited by hardcoded targets
+    
+    // Only cap to available capital (safety check)
 
     // Capital check
     if (tradeUp + tradeDown > currentCapital) {
@@ -1847,8 +1714,8 @@ async function buildPositionIncrementally(market: typeof discoveredMarkets exten
     const execPriceUp = Math.max(0.02, Math.min(0.98, orderBookPrices.execPriceUp));
     const execPriceDown = Math.max(0.02, Math.min(0.98, orderBookPrices.execPriceDown));
 
-    // Execute UP trade (minimum 0.5 shares like watcher)
-    if (sharesUp >= MIN_SHARES && tradeUp > 0 && currentCapital >= tradeUp) {
+    // Execute UP trade - use size from parameters (no hardcoded minimums)
+    if (sharesUp > 0 && tradeUp > 0 && currentCapital >= tradeUp) {
         // Recalculate trade value at execution price
         const execTradeUp = sharesUp * execPriceUp;
 
@@ -1878,6 +1745,10 @@ async function buildPositionIncrementally(market: typeof discoveredMarkets exten
             createdAt: now,
         };
         await logPaperTrade(tempPos, 'UP', 'BUY', sharesUp, execTradeUp, execPriceUp);
+        
+        // Record trade in policy integrator for inventory/cadence tracking
+        const paramMarketKeyUp = getParamMarketKey(market.marketKey);
+        policyIntegrator.recordTradeExecution(paramMarketKeyUp, now, 'UP', sharesUp, execTradeUp);
 
         // Track last trade side for sequence pattern
         buildState.lastTradeSide = 'UP';
@@ -1886,8 +1757,8 @@ async function buildPositionIncrementally(market: typeof discoveredMarkets exten
         debugLog(`buildPosition: ${market.marketKey} UP trade #${buildState.tradeCount}: ${sharesUp.toFixed(1)} shares @ ${execPriceUp.toFixed(4)} = $${execTradeUp.toFixed(2)}`);
     }
 
-    // Execute DOWN trade (minimum 0.5 shares like watcher)
-    if (sharesDown >= MIN_SHARES && tradeDown > 0 && currentCapital >= tradeDown) {
+    // Execute DOWN trade - use size from parameters (no hardcoded minimums)
+    if (sharesDown > 0 && tradeDown > 0 && currentCapital >= tradeDown) {
         // Recalculate trade value at execution price
         const execTradeDown = sharesDown * execPriceDown;
 
@@ -1916,6 +1787,10 @@ async function buildPositionIncrementally(market: typeof discoveredMarkets exten
             createdAt: now,
         };
         await logPaperTrade(tempPos, 'DOWN', 'BUY', sharesDown, execTradeDown, execPriceDown);
+        
+        // Record trade in policy integrator for inventory/cadence tracking
+        const paramMarketKeyDown = getParamMarketKey(market.marketKey);
+        policyIntegrator.recordTradeExecution(paramMarketKeyDown, now, 'DOWN', sharesDown, execTradeDown);
 
         // Track last trade side for sequence pattern
         buildState.lastTradeSide = 'DOWN';
@@ -1924,25 +1799,11 @@ async function buildPositionIncrementally(market: typeof discoveredMarkets exten
         debugLog(`buildPosition: ${market.marketKey} DOWN trade #${buildState.tradeCount}: ${sharesDown.toFixed(1)} shares @ ${execPriceDown.toFixed(4)} = $${execTradeDown.toFixed(2)}`);
     }
 
-    // Set next trade time based on EXACT watcher gap distribution
-    // Dec 29 - 3,018 trades: 61% at 2-3s, 14% at 3-5s, 15% at 5-10s, 9% at 10-30s
-    // Average: 4.65s, Median: 2.00s
-    const gapRoll = Math.random();
-    let gap: number;
-    if (gapRoll < 0.61) {
-        gap = 2000 + Math.random() * 1000; // 2-3s (61%)
-    } else if (gapRoll < 0.75) {
-        gap = 3000 + Math.random() * 2000; // 3-5s (14%)
-    } else if (gapRoll < 0.90) {
-        gap = 5000 + Math.random() * 5000; // 5-10s (15%)
-    } else if (gapRoll < 0.99) {
-        gap = 10000 + Math.random() * 20000; // 10-30s (9%)
-    } else {
-        gap = 30000 + Math.random() * 30000; // 30-60s (1%)
-    }
-
+    // REMOVED: Hardcoded gap calculation - cadence_params handles ALL timing
+    // Parameters show min_inter_trade_ms: 0.0, p50: 0.0, p95: 2000.0
+    // The cadence check (which happens BEFORE trades) handles rate limiting
+    // We just record the trade time for cadence tracking
     buildState.lastTradeTime = now;
-    buildState.nextTradeTime = now + gap;
 }
 
 /**
@@ -2012,57 +1873,11 @@ async function executeArbitrageTrade(position: MarketPosition, market: typeof di
     const priceUp = market.priceUp;
     const priceDown = market.priceDown;
 
-    // Identify clear winner and cheap loser
-    let winner: 'UP' | 'DOWN' | null = null;
-    let loserPrice = 0;
-
-    if (priceUp >= CLEAR_OUTCOME_THRESHOLD && priceDown <= MAX_LOSER_PRICE && priceDown >= MIN_LOSER_PRICE) {
-        winner = 'UP';
-        loserPrice = priceDown;
-    } else if (priceDown >= CLEAR_OUTCOME_THRESHOLD && priceUp <= MAX_LOSER_PRICE && priceUp >= MIN_LOSER_PRICE) {
-        winner = 'DOWN';
-        loserPrice = priceUp;
-    }
-
-    // If outcome not clear - DO NOTHING (this is key to the strategy)
-    if (!winner) {
-        // Silently skip unclear outcomes - this is expected behavior
-        return;
-    }
-
-    // Create unique cycle key to prevent double-trading
-    const cycleKey = `${position.conditionId}:${Math.floor(position.endDate / 60000)}`;
-    if (processedCycles.has(cycleKey)) return;
-    processedCycles.add(cycleKey);
-
-    // Calculate arbitrage trade size
-    const availableCapital = Math.min(currentCapital, PAPER_MAX_TRADE);
-    if (availableCapital < PAPER_MIN_TRADE) return;
-
-    const arbShares = availableCapital / loserPrice;
-    const arbCost = availableCapital;
-
-    // Deduct capital
-    currentCapital -= arbCost;
-
-    // Update position
-    if (winner === 'UP') {
-        // UP is winning, buy DOWN (the loser) - it's cheap but will pay $1 if UP actually loses
-        position.arbSharesDown += arbShares;
-        position.arbCostDown += arbCost;
-    } else {
-        // DOWN is winning, buy UP (the loser)
-        position.arbSharesUp += arbShares;
-        position.arbCostUp += arbCost;
-    }
-
-    position.hasArbitragePosition = true;
-    totalTrades++;
-
-    const loserSide = winner === 'UP' ? 'DOWN' : 'UP';
-    await logPaperTrade(position, loserSide, 'BUY', arbShares, arbCost, loserPrice);
-
-    debugLog(`🎯 ARB: ${position.marketKey} | Bought ${loserSide} @ $${loserPrice.toFixed(4)} (${arbShares.toFixed(0)} shares for $${arbCost.toFixed(2)}) | Winner: ${winner} (${((winner === 'UP' ? priceUp : priceDown) * 100).toFixed(1)}%)`);
+    // REMOVED: Hardcoded arbitrage logic - this is a separate strategy
+    // All trading now uses parameters from params_latest.json
+    // Arbitrage would need to be parameter-based if needed in the future
+    debugLog(`executeArbitrageTrade: ${market.marketKey} - Arbitrage logic removed (parameter-based trading only)`);
+    return;
 }
 
 /**

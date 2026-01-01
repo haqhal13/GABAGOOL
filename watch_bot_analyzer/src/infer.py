@@ -488,6 +488,53 @@ def apply_fallback_logic(params: Dict[str, Any], trades: pd.DataFrame) -> Dict[s
     return result_params
 
 
+def transform_params_to_market_format(params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Transform parameters from param-type-first to market-first format.
+    
+    Input format:
+    {
+        "entry_params": {"per_market": {"BTC_15m": {...}, ...}},
+        "size_params": {"per_market": {"BTC_15m": {...}, ...}},
+        ...
+    }
+    
+    Output format:
+    {
+        "BTC_15m": {
+            "entry_params": {...},
+            "size_params": {...},
+            "inventory_params": {...},
+            "cadence_params": {...},
+            "confidence": {...}
+        },
+        ...
+    }
+    """
+    # Collect all markets from all param types
+    all_markets = set()
+    for param_type in ['entry_params', 'size_params', 'inventory_params', 'cadence_params']:
+        per_market = params.get(param_type, {}).get('per_market', {})
+        all_markets.update(per_market.keys())
+    
+    # Also get markets from confidence
+    confidence = params.get('confidence', {}).get('per_market', {})
+    all_markets.update(confidence.keys())
+    
+    # Build market-first structure
+    result = {}
+    for market in all_markets:
+        result[market] = {
+            'entry_params': params.get('entry_params', {}).get('per_market', {}).get(market, {}),
+            'size_params': params.get('size_params', {}).get('per_market', {}).get(market, {}),
+            'inventory_params': params.get('inventory_params', {}).get('per_market', {}).get(market, {}),
+            'cadence_params': params.get('cadence_params', {}).get('per_market', {}).get(market, {}),
+            'confidence': confidence.get(market, {})
+        }
+    
+    return result
+
+
 def infer_all_parameters(tape: pd.DataFrame, trades: pd.DataFrame) -> Dict[str, Any]:
     """
     Infer all WATCH bot parameters with confidence scores and fallback logic.
@@ -498,6 +545,7 @@ def infer_all_parameters(tape: pd.DataFrame, trades: pd.DataFrame) -> Dict[str, 
         
     Returns:
         Dictionary with all inferred parameters including confidence scores
+        Format: {market: {entry_params, size_params, inventory_params, cadence_params, confidence}}
     """
     print("\n=== Inferring Parameters ===")
     
@@ -526,12 +574,18 @@ def infer_all_parameters(tape: pd.DataFrame, trades: pd.DataFrame) -> Dict[str, 
     confidence = compute_confidence_scores(trades, tape, params)
     params['confidence'] = {'per_market': confidence}
     
-    # Print summary
-    for market, conf in confidence.items():
-        print(f"{market}: n_trades={conf['n_watch_trades']}, "
-              f"entry_precision={conf['entry_rule_precision']:.2%}, "
-              f"entry_recall={conf['entry_rule_recall']:.2%}, "
-              f"size_var={conf['size_table_bucket_variance']:.2f}")
+    # Print per-market summary
+    print("\n=== Per-Market Summary ===")
+    for market in sorted(confidence.keys()):
+        conf = confidence[market]
+        print(f"\n{market}:")
+        print(f"  n_watch_trades: {conf['n_watch_trades']}")
+        print(f"  entry_rule_precision: {conf['entry_rule_precision']:.2%}")
+        print(f"  entry_rule_recall: {conf['entry_rule_recall']:.2%}")
+        print(f"  size_table_bucket_variance: {conf['size_table_bucket_variance']:.2f}")
     
-    return params
+    # Transform to market-first format
+    params_market_format = transform_params_to_market_format(params)
+    
+    return params_market_format
 

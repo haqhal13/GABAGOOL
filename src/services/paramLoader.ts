@@ -43,7 +43,9 @@ export interface MarketParams {
     cadence_params?: CadenceParams;
 }
 
+// Support both old format (param-type-first) and new format (market-first)
 export interface ParameterFile {
+    // Old format: param-type-first
     entry_params?: {
         per_market: Record<string, EntryParams>;
     };
@@ -56,6 +58,16 @@ export interface ParameterFile {
     cadence_params?: {
         per_market: Record<string, CadenceParams>;
     };
+    // New format: market-first (BTC_15m, ETH_15m, BTC_1h, ETH_1h as top-level keys)
+    [market: string]: {
+        entry_params?: EntryParams;
+        size_params?: SizeParams;
+        inventory_params?: InventoryParams;
+        cadence_params?: CadenceParams;
+        confidence?: any;
+    } | {
+        per_market: Record<string, any>;
+    } | undefined;
 }
 
 class ParameterLoader {
@@ -80,21 +92,78 @@ class ParameterLoader {
             }
 
             const fileContent = fs.readFileSync(this.paramsPath, 'utf8');
-            const parsed = JSON.parse(fileContent) as ParameterFile;
+            const parsed = JSON.parse(fileContent) as any;
+
+            // Detect format: new format has market keys (BTC_15m, ETH_15m, etc.) as top-level
+            const isNewFormat = this.isNewFormat(parsed);
+            
+            // Convert new format to old format for compatibility
+            const normalized = isNewFormat ? this.convertNewToOldFormat(parsed) : parsed;
 
             // Validate structure
-            this.validateParams(parsed);
+            this.validateParams(normalized);
 
             // Update timestamp
             const stats = fs.statSync(this.paramsPath);
             this.lastModified = stats.mtimeMs;
 
-            this.params = parsed;
-            return parsed;
+            this.params = normalized;
+            return normalized;
         } catch (error) {
             console.error(`Error loading parameters from ${this.paramsPath}:`, error);
             return this.getDefaultParams();
         }
+    }
+
+    /**
+     * Check if params file is in new format (market-first)
+     */
+    private isNewFormat(params: any): boolean {
+        // New format has market keys like "BTC_15m", "ETH_15m", etc. as top-level
+        // Old format has "entry_params", "size_params", etc. as top-level
+        const marketKeys = ['BTC_15m', 'ETH_15m', 'BTC_1h', 'ETH_1h'];
+        const hasMarketKey = marketKeys.some(key => key in params);
+        const hasOldFormatKey = 'entry_params' in params || 'size_params' in params;
+        
+        // If it has market keys but not old format keys, it's new format
+        return hasMarketKey && !hasOldFormatKey;
+    }
+
+    /**
+     * Convert new format (market-first) to old format (param-type-first) for compatibility
+     */
+    private convertNewToOldFormat(newFormat: any): ParameterFile {
+        const oldFormat: ParameterFile = {
+            entry_params: { per_market: {} },
+            size_params: { per_market: {} },
+            inventory_params: { per_market: {} },
+            cadence_params: { per_market: {} }
+        };
+
+        // Iterate through market keys (BTC_15m, ETH_15m, etc.)
+        for (const marketKey in newFormat) {
+            // Skip if it's not a market key (e.g., metadata)
+            if (!['BTC_15m', 'ETH_15m', 'BTC_1h', 'ETH_1h'].includes(marketKey)) {
+                continue;
+            }
+
+            const marketParams = newFormat[marketKey];
+            
+            if (marketParams.entry_params) {
+                oldFormat.entry_params!.per_market[marketKey] = marketParams.entry_params;
+            }
+            if (marketParams.size_params) {
+                oldFormat.size_params!.per_market[marketKey] = marketParams.size_params;
+            }
+            if (marketParams.inventory_params) {
+                oldFormat.inventory_params!.per_market[marketKey] = marketParams.inventory_params;
+            }
+            if (marketParams.cadence_params) {
+                oldFormat.cadence_params!.per_market[marketKey] = marketParams.cadence_params;
+            }
+        }
+
+        return oldFormat;
     }
 
     /**
@@ -113,7 +182,7 @@ class ParameterLoader {
      * Validate parameter structure
      */
     private validateParams(params: ParameterFile): void {
-        // Basic validation - ensure structure exists
+        // Basic validation - ensure structure exists (old format)
         if (!params.entry_params) params.entry_params = { per_market: {} };
         if (!params.size_params) params.size_params = { per_market: {} };
         if (!params.inventory_params) params.inventory_params = { per_market: {} };

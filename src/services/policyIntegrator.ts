@@ -208,6 +208,23 @@ class PolicyIntegrator {
     }
 
     /**
+     * Get cadence info for a market (public accessor)
+     */
+    getCadenceInfo(market: string): { lastTradeTime: number | null; recentTradeTimes: number[] } {
+        return {
+            lastTradeTime: this.policyState.lastTradeTime.get(market) || null,
+            recentTradeTimes: this.policyState.recentTradeTimes.get(market) || []
+        };
+    }
+
+    /**
+     * Get price history for a market (public accessor for feature computation)
+     */
+    getPriceHistory(market: string): PriceHistory[] {
+        return this.policyState.priceHistory.get(market) || [];
+    }
+
+    /**
      * Reset inventory (for testing or manual reset)
      */
     resetInventory(market?: string): void {

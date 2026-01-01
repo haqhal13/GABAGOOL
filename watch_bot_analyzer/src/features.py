@@ -3,7 +3,7 @@ Feature engineering for WATCH bot trades.
 """
 import pandas as pd
 import numpy as np
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 
 
 def compute_price_changes(tape: pd.DataFrame, trades: pd.DataFrame, windows_ms: List[int]) -> pd.DataFrame:
@@ -39,8 +39,8 @@ def compute_price_changes(tape: pd.DataFrame, trades: pd.DataFrame, windows_ms: 
             if len(market_tape) == 0:
                 continue
             
-            # Create index on timestamp for faster lookup
-            market_tape = market_tape.set_index('Timestamp')
+            # Sort by timestamp for efficient lookup
+            market_tape = market_tape.sort_values('Timestamp').reset_index(drop=True)
             
             for idx, trade_row in market_trades.iterrows():
                 trade_ts = trade_row['Timestamp']
@@ -50,26 +50,32 @@ def compute_price_changes(tape: pd.DataFrame, trades: pd.DataFrame, windows_ms: 
                 
                 # Get closest prices
                 try:
-                    current_up = market_tape.loc[trade_ts, 'Price UP ($)']
-                    current_down = market_tape.loc[trade_ts, 'Price DOWN ($)']
+                    # Find closest timestamp to trade_ts
+                    time_diffs = abs(market_tape['Timestamp'] - trade_ts)
+                    closest_idx = time_diffs.idxmin()
+                    if time_diffs.iloc[closest_idx] > 5000:  # More than 5s away, skip
+                        continue
+                    
+                    current_up = market_tape.loc[closest_idx, 'Price UP ($)']
+                    current_down = market_tape.loc[closest_idx, 'Price DOWN ($)']
                     
                     # Find closest timestamp before
-                    before_rows = market_tape[market_tape.index <= before_ts]
-                    if len(before_rows) > 0:
-                        before_ts_actual = before_rows.index[-1]
-                        before_up = market_tape.loc[before_ts_actual, 'Price UP ($)']
-                        before_down = market_tape.loc[before_ts_actual, 'Price DOWN ($)']
+                    before_mask = market_tape['Timestamp'] <= before_ts
+                    if before_mask.any():
+                        before_idx = market_tape[before_mask]['Timestamp'].idxmax()
+                        before_up = market_tape.loc[before_idx, 'Price UP ($)']
+                        before_down = market_tape.loc[before_idx, 'Price DOWN ($)']
                         
                         # Compute deltas
-                        trades.loc[idx, f'delta_{window_s}s_up_px'] = current_up - before_up
-                        trades.loc[idx, f'delta_{window_s}s_down_px'] = current_down - before_down
+                        trades.at[idx, f'delta_{window_s}s_up_px'] = float(current_up - before_up)
+                        trades.at[idx, f'delta_{window_s}s_down_px'] = float(current_down - before_down)
                         
                         # Side-specific delta
                         if trade_row['side'] == 'UP':
-                            trades.loc[idx, f'delta_{window_s}s_side_px'] = current_up - before_up
+                            trades.at[idx, f'delta_{window_s}s_side_px'] = float(current_up - before_up)
                         else:
-                            trades.loc[idx, f'delta_{window_s}s_side_px'] = current_down - before_down
-                except (KeyError, IndexError):
+                            trades.at[idx, f'delta_{window_s}s_side_px'] = float(current_down - before_down)
+                except (KeyError, IndexError, ValueError):
                     # Trade timestamp not found in tape, skip
                     continue
     

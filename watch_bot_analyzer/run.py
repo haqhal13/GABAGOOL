@@ -57,22 +57,43 @@ def main():
     print("\n[4/6] Inferring parameters...")
     params = infer_all_parameters(tape, trades)
     
-    # Print summary
+    # Print summary (params are now in market-first format)
     print("\n=== Inferred Parameters Summary ===")
-    for param_type, param_data in params.items():
-        if 'per_market' in param_data:
-            print(f"\n{param_type}:")
-            for market, market_params in param_data['per_market'].items():
-                print(f"  {market}:")
-                for key, value in market_params.items():
-                    if isinstance(value, dict):
-                        print(f"    {key}: {len(value)} entries")
+    for market in sorted(params.keys()):
+        market_params = params[market]
+        print(f"\n{market}:")
+        for param_type in ['entry_params', 'size_params', 'inventory_params', 'cadence_params', 'confidence']:
+            if param_type in market_params:
+                value = market_params[param_type]
+                if isinstance(value, dict):
+                    if param_type == 'size_params' and 'size_table' in value:
+                        print(f"  {param_type}: {len(value.get('size_table', {}))} buckets")
+                    elif param_type == 'confidence':
+                        conf = value
+                        print(f"  {param_type}: n_trades={conf.get('n_watch_trades', 0)}, "
+                              f"entry_precision={conf.get('entry_rule_precision', 0):.2%}, "
+                              f"entry_recall={conf.get('entry_rule_recall', 0):.2%}, "
+                              f"size_var={conf.get('size_table_bucket_variance', 0):.2f}")
                     else:
-                        print(f"    {key}: {value}")
+                        print(f"  {param_type}: {len(value)} keys")
+                else:
+                    print(f"  {param_type}: {value}")
     
     # Step 5: Model validation
     print("\n[5/6] Validating model...")
     validation_results = validate_model(tape, trades, params)
+    
+    # Merge validation metrics into confidence scores
+    per_market_validation = validation_results.get('metrics', {}).get('per_market', {})
+    for market in params.keys():
+        if market in per_market_validation:
+            if 'confidence' not in params[market]:
+                params[market]['confidence'] = {}
+            # Add validation metrics to confidence
+            val_metrics = per_market_validation[market]
+            params[market]['confidence']['entry_precision'] = val_metrics.get('precision', 0.0)
+            params[market]['confidence']['entry_recall'] = val_metrics.get('recall', 0.0)
+            params[market]['confidence']['size_mape'] = val_metrics.get('size_mape', 0.0)
     
     # Step 6: Generate reports
     print("\n[6/6] Generating reports...")

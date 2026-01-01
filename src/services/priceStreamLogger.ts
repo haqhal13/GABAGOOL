@@ -790,9 +790,9 @@ class PriceStreamLogger {
     this.ws = new WebSocket(CONFIG.WS_URL);
 
     this.ws.on('open', () => this.onOpen());
-    this.ws.on('message', (data) => this.onMessage(data));
-    this.ws.on('error', (error) => this.onError(error));
-    this.ws.on('close', (code, reason) => this.onClose(code, reason));
+    this.ws.on('message', (data: WebSocket.RawData) => this.onMessage(data));
+    this.ws.on('error', (error: Error) => this.onError(error));
+    this.ws.on('close', (code: number, reason: Buffer) => this.onClose(code, reason));
     this.ws.on('pong', () => log('debug', 'Received pong'));
   }
 

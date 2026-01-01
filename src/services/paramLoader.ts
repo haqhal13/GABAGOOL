@@ -36,11 +36,70 @@ export interface CadenceParams {
     max_trades_per_min: number;
 }
 
+export interface SideSelectionParams {
+    mode: 'inventory_driven' | 'edge_driven' | 'alternating' | 'fixed_preference';
+    inventory_driven_score?: number;
+    alternation_score?: number;
+    edge_driven_score?: number;
+    fixed_preference_score?: number;
+    preferred_side?: 'UP' | 'DOWN' | null;
+}
+
+export interface ExecutionParams {
+    model_type: 'snapshot_price' | 'mid_price' | 'worst_case' | 'fixed_slippage';
+    fill_bias_median: number;
+    fill_bias_mean?: number;
+    fill_bias_std?: number;
+    fill_bias_p25?: number;
+    fill_bias_p75?: number;
+    slippage_offset: number;
+}
+
+export interface CooldownParams {
+    has_time_cooldown: boolean;
+    time_cooldown_seconds: number;
+    price_move_threshold: number | null;
+    has_inventory_lockout: boolean;
+    inventory_lockout_threshold: number | null;
+}
+
+export interface RiskParams {
+    max_trades_per_session: number | null;
+    max_imbalance_ratio: number;
+    max_exposure_up_shares: number;
+    max_exposure_down_shares: number;
+}
+
+export interface UnwindParams {
+    has_unwind: boolean;
+    unwind_start_ratio: number | null;
+    reduces_without_rebalance: boolean;
+}
+
+export interface ResetParams {
+    resets_on_market_switch: boolean;
+    resets_on_inactivity: boolean;
+    inactivity_threshold_hours: number;
+}
+
+export interface QualityFilterParams {
+    max_price_sum_deviation: number;
+    timestamp_jump_threshold_seconds: number;
+    price_gap_threshold: number;
+}
+
 export interface MarketParams {
     entry_params?: EntryParams;
     size_params?: SizeParams;
     inventory_params?: InventoryParams;
     cadence_params?: CadenceParams;
+    side_selection_params?: SideSelectionParams;
+    execution_params?: ExecutionParams;
+    cooldown_params?: CooldownParams;
+    risk_params?: RiskParams;
+    unwind_params?: UnwindParams;
+    reset_params?: ResetParams;
+    quality_filter_params?: QualityFilterParams;
 }
 
 // Support both old format (param-type-first) and new format (market-first)
@@ -64,6 +123,13 @@ export interface ParameterFile {
         size_params?: SizeParams;
         inventory_params?: InventoryParams;
         cadence_params?: CadenceParams;
+        side_selection_params?: SideSelectionParams;
+        execution_params?: ExecutionParams;
+        cooldown_params?: CooldownParams;
+        risk_params?: RiskParams;
+        unwind_params?: UnwindParams;
+        reset_params?: ResetParams;
+        quality_filter_params?: QualityFilterParams;
         confidence?: any;
     } | {
         per_market: Record<string, any>;
@@ -161,6 +227,8 @@ class ParameterLoader {
             if (marketParams.cadence_params) {
                 oldFormat.cadence_params!.per_market[marketKey] = marketParams.cadence_params;
             }
+            // Note: New params are kept in market-first format, not converted
+            // They will be accessed directly from the new format structure
         }
 
         return oldFormat;
@@ -211,12 +279,34 @@ class ParameterLoader {
         // Convert market key format (e.g., "BTC-UpDown-15" -> "BTC_15m")
         const normalizedKey = this.normalizeMarketKey(marketKey);
 
-        return {
-            entry_params: params.entry_params?.per_market[normalizedKey],
-            size_params: params.size_params?.per_market[normalizedKey],
-            inventory_params: params.inventory_params?.per_market[normalizedKey],
-            cadence_params: params.cadence_params?.per_market[normalizedKey]
-        };
+        // Check if params are in new format (market-first)
+        const isNewFormat = this.isNewFormat(params);
+        
+        if (isNewFormat && normalizedKey in params) {
+            // New format: params are already market-first
+            const marketParams = params[normalizedKey] as any;
+            return {
+                entry_params: marketParams.entry_params,
+                size_params: marketParams.size_params,
+                inventory_params: marketParams.inventory_params,
+                cadence_params: marketParams.cadence_params,
+                side_selection_params: marketParams.side_selection_params,
+                execution_params: marketParams.execution_params,
+                cooldown_params: marketParams.cooldown_params,
+                risk_params: marketParams.risk_params,
+                unwind_params: marketParams.unwind_params,
+                reset_params: marketParams.reset_params,
+                quality_filter_params: marketParams.quality_filter_params
+            };
+        } else {
+            // Old format: param-type-first
+            return {
+                entry_params: params.entry_params?.per_market[normalizedKey],
+                size_params: params.size_params?.per_market[normalizedKey],
+                inventory_params: params.inventory_params?.per_market[normalizedKey],
+                cadence_params: params.cadence_params?.per_market[normalizedKey]
+            };
+        }
     }
 
     /**

@@ -1,10 +1,10 @@
 {
-  "BTC_1h": {
+  "ETH_1h": {
     "entry_params": {
-      "up_price_min": 0.001,
-      "up_price_max": 0.999,
-      "down_price_min": 0.015,
-      "down_price_max": 0.999,
+      "up_price_min": 0.32,
+      "up_price_max": 0.545,
+      "down_price_min": 0.455,
+      "down_price_max": 0.68,
       "momentum_window_s": 5.0,
       "momentum_threshold": 0.0,
       "mode": "none"
@@ -34,80 +34,223 @@
         1.0
       ],
       "size_table": {
-        "(-0.001, 0.05]": 10.0,
-        "(0.05, 0.1]": 11.995000000000001,
-        "(0.1, 0.15]": 10.0,
-        "(0.15, 0.2]": 10.0,
-        "(0.2, 0.25]": 9.26,
-        "(0.25, 0.3]": 10.0,
-        "(0.3, 0.35]": 10.32715,
-        "(0.35, 0.4]": 11.0,
-        "(0.4, 0.45]": 10.0,
-        "(0.45, 0.5]": 11.0,
+        "(0.3, 0.35]": 10.0,
+        "(0.35, 0.4]": 10.0,
+        "(0.4, 0.45]": 9.05,
+        "(0.45, 0.5]": 3.27,
         "(0.5, 0.55]": 10.0,
-        "(0.55, 0.6]": 11.0,
-        "(0.6, 0.65]": 12.0,
-        "(0.65, 0.7]": 12.0,
-        "(0.7, 0.75]": 11.0,
-        "(0.75, 0.8]": 10.08,
-        "(0.8, 0.85]": 10.0,
-        "(0.85, 0.9]": 8.0,
-        "(0.9, 0.95]": 12.0,
-        "(0.95, 1.0]": 8.0
+        "(0.55, 0.6]": 10.0,
+        "(0.6, 0.65]": 7.04,
+        "(0.65, 0.7]": 9.45
       },
       "size_table_mean": {
-        "(-0.001, 0.05]": 10.298666666666666,
-        "(0.05, 0.1]": 10.266902,
-        "(0.1, 0.15]": 10.240175,
-        "(0.15, 0.2]": 9.027268452380952,
-        "(0.2, 0.25]": 8.904011409395972,
-        "(0.25, 0.3]": 9.113525252525253,
-        "(0.3, 0.35]": 9.448255649717513,
-        "(0.35, 0.4]": 10.132050628930818,
-        "(0.4, 0.45]": 9.355947619047619,
-        "(0.45, 0.5]": 10.15418272251309,
-        "(0.5, 0.55]": 9.583928464977644,
-        "(0.55, 0.6]": 10.074621654929578,
-        "(0.6, 0.65]": 10.791350786163523,
-        "(0.65, 0.7]": 10.809670612244897,
-        "(0.7, 0.75]": 10.286188524590164,
-        "(0.75, 0.8]": 9.271661240310078,
-        "(0.8, 0.85]": 9.321198780487805,
-        "(0.85, 0.9]": 8.365009803921568,
-        "(0.9, 0.95]": 9.31304347826087,
-        "(0.95, 1.0]": 7.9425
+        "(0.3, 0.35]": 8.782222222222222,
+        "(0.35, 0.4]": 7.906266666666667,
+        "(0.4, 0.45]": 6.7790625,
+        "(0.45, 0.5]": 5.016666666666667,
+        "(0.5, 0.55]": 7.3100000000000005,
+        "(0.55, 0.6]": 7.631933333333333,
+        "(0.6, 0.65]": 6.92375,
+        "(0.65, 0.7]": 7.74
       },
       "conditioning_var": null
     },
     "inventory_params": {
-      "rebalance_ratio_R": 0.15776838138530377,
-      "max_up_shares": 28516.512999999955,
-      "max_down_shares": 27206.516599999974,
-      "max_total_shares": 55723.02959999993
+      "rebalance_ratio_R": 0.23897191647395072,
+      "max_up_shares": 452.62519999999995,
+      "max_down_shares": 454.97959999999983,
+      "max_total_shares": 907.6047999999998
     },
     "cadence_params": {
       "min_inter_trade_ms": 0.0,
       "p50_inter_trade_ms": 0.0,
-      "p95_inter_trade_ms": 30000.0,
-      "max_trades_per_sec": 81,
-      "max_trades_per_min": 155
+      "p95_inter_trade_ms": 31899.999999999978,
+      "max_trades_per_sec": 9,
+      "max_trades_per_min": 30
+    },
+    "side_selection_params": {
+      "mode": "edge_driven",
+      "inventory_driven_score": 0.45528455284552843,
+      "alternation_score": 0.2459016393442623,
+      "edge_driven_score": 0.7154471544715447,
+      "fixed_preference_score": 0.5121951219512195,
+      "preferred_side": null
+    },
+    "execution_params": {
+      "model_type": "snapshot_price",
+      "fill_bias_median": -0.0006999999999999229,
+      "fill_bias_mean": -0.005464227642276421,
+      "fill_bias_std": 0.023151842821457644,
+      "fill_bias_p25": -0.015000000000000013,
+      "fill_bias_p75": 0.007500000000000007,
+      "slippage_offset": 0.0
+    },
+    "cooldown_params": {
+      "has_time_cooldown": false,
+      "time_cooldown_seconds": 0.0,
+      "price_move_threshold": null,
+      "has_inventory_lockout": false,
+      "inventory_lockout_threshold": null
+    },
+    "risk_params": {
+      "max_trades_per_session": 123,
+      "max_imbalance_ratio": 1.0,
+      "max_exposure_up_shares": 452.62519999999995,
+      "max_exposure_down_shares": 454.9796
+    },
+    "unwind_params": {
+      "has_unwind": false,
+      "unwind_start_ratio": null,
+      "reduces_without_rebalance": false
+    },
+    "reset_params": {
+      "resets_on_market_switch": true,
+      "resets_on_inactivity": false,
+      "inactivity_threshold_hours": 2.0
+    },
+    "quality_filter_params": {
+      "max_price_sum_deviation": 0.05,
+      "timestamp_jump_threshold_seconds": 60.0,
+      "price_gap_threshold": 0.2475
     },
     "confidence": {
-      "n_watch_trades": 5662,
+      "n_watch_trades": 123,
       "entry_rule_precision": 1.0,
-      "entry_rule_recall": 0.12734115563427054,
-      "size_table_bucket_variance": 1.2852812495687505,
-      "entry_precision": 0.16899595439499815,
-      "entry_recall": 0.16231013776050865,
-      "size_mape": 523.800090334459
+      "entry_rule_recall": 0.22140221402214022,
+      "size_table_bucket_variance": 4.950935937500001,
+      "entry_precision": 0.4049586776859504,
+      "entry_recall": 0.3983739837398374,
+      "size_mape": 83.78065665166089
+    }
+  },
+  "BTC_1h": {
+    "entry_params": {
+      "up_price_min": 0.325,
+      "up_price_max": 0.46,
+      "down_price_min": 0.575,
+      "down_price_max": 0.705,
+      "momentum_window_s": 5.0,
+      "momentum_threshold": 0.0,
+      "mode": "none"
+    },
+    "size_params": {
+      "bin_edges": [
+        0.0,
+        0.05,
+        0.1,
+        0.15000000000000002,
+        0.2,
+        0.25,
+        0.30000000000000004,
+        0.35000000000000003,
+        0.4,
+        0.45,
+        0.5,
+        0.55,
+        0.6000000000000001,
+        0.65,
+        0.7000000000000001,
+        0.75,
+        0.8,
+        0.8500000000000001,
+        0.9,
+        0.9500000000000001,
+        1.0
+      ],
+      "size_table": {
+        "(0.3, 0.35]": 10.0,
+        "(0.35, 0.4]": 5.0,
+        "(0.45, 0.5]": 10.0,
+        "(0.55, 0.6]": 16.0,
+        "(0.6, 0.65]": 10.0,
+        "(0.65, 0.7]": 11.2,
+        "(0.7, 0.75]": 16.0
+      },
+      "size_table_mean": {
+        "(0.3, 0.35]": 10.265861904761906,
+        "(0.35, 0.4]": 7.364545454545455,
+        "(0.45, 0.5]": 10.559999999999999,
+        "(0.55, 0.6]": 12.8,
+        "(0.6, 0.65]": 9.64,
+        "(0.65, 0.7]": 9.713527777777777,
+        "(0.7, 0.75]": 16.0
+      },
+      "conditioning_var": null
+    },
+    "inventory_params": {
+      "rebalance_ratio_R": 0.2281100467081446,
+      "max_up_shares": 391.6331,
+      "max_down_shares": 322.3235,
+      "max_total_shares": 713.9566
+    },
+    "cadence_params": {
+      "min_inter_trade_ms": 0.0,
+      "p50_inter_trade_ms": 0.0,
+      "p95_inter_trade_ms": 55000.0,
+      "max_trades_per_sec": 4,
+      "max_trades_per_min": 33
+    },
+    "side_selection_params": {
+      "mode": "inventory_driven",
+      "inventory_driven_score": 0.4305555555555556,
+      "alternation_score": 0.2112676056338028,
+      "edge_driven_score": 0.19444444444444445,
+      "fixed_preference_score": 0.5694444444444444,
+      "preferred_side": null
+    },
+    "execution_params": {
+      "model_type": "mid_price",
+      "fill_bias_median": -0.010000000000000009,
+      "fill_bias_mean": -0.01756944444444444,
+      "fill_bias_std": 0.021505701045749132,
+      "fill_bias_p25": -0.03499999999999992,
+      "fill_bias_p75": -0.0050000000000000044,
+      "slippage_offset": 0.0
+    },
+    "cooldown_params": {
+      "has_time_cooldown": false,
+      "time_cooldown_seconds": 0.0,
+      "price_move_threshold": null,
+      "has_inventory_lockout": false,
+      "inventory_lockout_threshold": null
+    },
+    "risk_params": {
+      "max_trades_per_session": 72,
+      "max_imbalance_ratio": 1.0,
+      "max_exposure_up_shares": 391.6331,
+      "max_exposure_down_shares": 322.32349999999997
+    },
+    "unwind_params": {
+      "has_unwind": false,
+      "unwind_start_ratio": null,
+      "reduces_without_rebalance": false
+    },
+    "reset_params": {
+      "resets_on_market_switch": true,
+      "resets_on_inactivity": false,
+      "inactivity_threshold_hours": 2.0
+    },
+    "quality_filter_params": {
+      "max_price_sum_deviation": 0.05,
+      "timestamp_jump_threshold_seconds": 60.0,
+      "price_gap_threshold": 0.25
+    },
+    "confidence": {
+      "n_watch_trades": 72,
+      "entry_rule_precision": 1.0,
+      "entry_rule_recall": 0.20098039215686275,
+      "size_table_bucket_variance": 12.69061224489796,
+      "entry_precision": 0.1527777777777778,
+      "entry_recall": 0.1527777777777778,
+      "size_mape": 81.54008438818565
     }
   },
   "ETH_15m": {
     "entry_params": {
-      "up_price_min": 0.015,
-      "up_price_max": 0.995,
-      "down_price_min": 0.01,
-      "down_price_max": 0.99,
+      "up_price_min": 0.08,
+      "up_price_max": 0.895,
+      "down_price_min": 0.1,
+      "down_price_max": 0.92,
       "momentum_window_s": 5.0,
       "momentum_threshold": 0.0,
       "mode": "none"
@@ -137,80 +280,121 @@
         1.0
       ],
       "size_table": {
-        "(-0.001, 0.05]": 6.26,
-        "(0.05, 0.1]": 8.0,
-        "(0.1, 0.15]": 5.3977,
-        "(0.15, 0.2]": 5.9524,
-        "(0.2, 0.25]": 6.57,
-        "(0.25, 0.3]": 9.0,
-        "(0.3, 0.35]": 9.99,
-        "(0.35, 0.4]": 9.99,
-        "(0.4, 0.45]": 9.0,
-        "(0.45, 0.5]": 11.0,
-        "(0.5, 0.55]": 11.0,
-        "(0.55, 0.6]": 10.2041,
-        "(0.6, 0.65]": 10.86,
-        "(0.65, 0.7]": 11.4286,
-        "(0.7, 0.75]": 9.0,
-        "(0.75, 0.8]": 10.05,
-        "(0.8, 0.85]": 8.9,
+        "(0.05, 0.1]": 11.435,
+        "(0.1, 0.15]": 3.6196,
+        "(0.15, 0.2]": 9.0,
+        "(0.2, 0.25]": 10.0,
+        "(0.25, 0.3]": 13.0,
+        "(0.3, 0.35]": 10.0,
+        "(0.35, 0.4]": 6.09845,
+        "(0.4, 0.45]": 10.0,
+        "(0.45, 0.5]": 15.37,
+        "(0.5, 0.55]": 5.0,
+        "(0.55, 0.6]": 15.995000000000001,
+        "(0.6, 0.65]": 16.0,
+        "(0.65, 0.7]": 11.74,
+        "(0.7, 0.75]": 13.0,
+        "(0.75, 0.8]": 10.0,
+        "(0.8, 0.85]": 13.0,
         "(0.85, 0.9]": 9.0,
-        "(0.9, 0.95]": 11.25,
-        "(0.95, 1.0]": 10.0
+        "(0.9, 0.95]": 12.0
       },
       "size_table_mean": {
-        "(-0.001, 0.05]": 7.0320347826086955,
-        "(0.05, 0.1]": 7.592722285714286,
-        "(0.1, 0.15]": 7.080048714810282,
-        "(0.15, 0.2]": 7.212377546777548,
-        "(0.2, 0.25]": 7.969328660968661,
-        "(0.25, 0.3]": 9.005277050473186,
-        "(0.3, 0.35]": 9.453781747404845,
-        "(0.35, 0.4]": 9.37811210114389,
-        "(0.4, 0.45]": 9.483034774881517,
-        "(0.45, 0.5]": 10.51793716525147,
-        "(0.5, 0.55]": 10.22287179331307,
-        "(0.55, 0.6]": 10.228409912339853,
-        "(0.6, 0.65]": 10.216586544741999,
-        "(0.65, 0.7]": 10.503933050847458,
-        "(0.7, 0.75]": 8.874741257995735,
-        "(0.75, 0.8]": 9.746049111807732,
-        "(0.8, 0.85]": 8.968211956521738,
-        "(0.85, 0.9]": 9.046894789579158,
-        "(0.9, 0.95]": 10.104525146198831,
-        "(0.95, 1.0]": 10.295438532110092
+        "(0.05, 0.1]": 11.435,
+        "(0.1, 0.15]": 5.414620895522388,
+        "(0.15, 0.2]": 9.193986274509804,
+        "(0.2, 0.25]": 10.516747619047619,
+        "(0.25, 0.3]": 10.241632727272728,
+        "(0.3, 0.35]": 9.98892972972973,
+        "(0.35, 0.4]": 7.312631818181819,
+        "(0.4, 0.45]": 9.885952272727273,
+        "(0.45, 0.5]": 12.772254098360655,
+        "(0.5, 0.55]": 7.189728048780487,
+        "(0.55, 0.6]": 13.047453846153845,
+        "(0.6, 0.65]": 12.024706382978724,
+        "(0.65, 0.7]": 11.110666101694916,
+        "(0.7, 0.75]": 11.9303328125,
+        "(0.75, 0.8]": 9.718002564102564,
+        "(0.8, 0.85]": 11.899166666666668,
+        "(0.85, 0.9]": 9.614160714285715,
+        "(0.9, 0.95]": 12.0
       },
       "conditioning_var": null
     },
     "inventory_params": {
-      "rebalance_ratio_R": 0.8223138852607794,
-      "max_up_shares": 105207.7029999993,
-      "max_down_shares": 93900.00699999976,
-      "max_total_shares": 199107.70999999906
+      "rebalance_ratio_R": 0.2551267796378392,
+      "max_up_shares": 4409.074599999999,
+      "max_down_shares": 5937.664399999994,
+      "max_total_shares": 10346.738999999994
     },
     "cadence_params": {
       "min_inter_trade_ms": 0.0,
       "p50_inter_trade_ms": 0.0,
-      "p95_inter_trade_ms": 8000.0,
-      "max_trades_per_sec": 169,
-      "max_trades_per_min": 361
+      "p95_inter_trade_ms": 4000.0,
+      "max_trades_per_sec": 81,
+      "max_trades_per_min": 326
+    },
+    "side_selection_params": {
+      "mode": "inventory_driven",
+      "inventory_driven_score": 0.439453125,
+      "alternation_score": 0.10850439882697947,
+      "edge_driven_score": 0.3623046875,
+      "fixed_preference_score": 0.5703125,
+      "preferred_side": null
+    },
+    "execution_params": {
+      "model_type": "mid_price",
+      "fill_bias_median": -0.010000000000000009,
+      "fill_bias_mean": -0.010108007812499997,
+      "fill_bias_std": 0.045623946630990175,
+      "fill_bias_p25": -0.035,
+      "fill_bias_p75": 0.014999999999999958,
+      "slippage_offset": 0.0
+    },
+    "cooldown_params": {
+      "has_time_cooldown": false,
+      "time_cooldown_seconds": 0.0,
+      "price_move_threshold": null,
+      "has_inventory_lockout": false,
+      "inventory_lockout_threshold": null
+    },
+    "risk_params": {
+      "max_trades_per_session": 867,
+      "max_imbalance_ratio": 1.0,
+      "max_exposure_up_shares": 4409.0746,
+      "max_exposure_down_shares": 5937.664400000001
+    },
+    "unwind_params": {
+      "has_unwind": false,
+      "unwind_start_ratio": null,
+      "reduces_without_rebalance": false
+    },
+    "reset_params": {
+      "resets_on_market_switch": true,
+      "resets_on_inactivity": false,
+      "inactivity_threshold_hours": 0.5
+    },
+    "quality_filter_params": {
+      "max_price_sum_deviation": 0.05,
+      "timestamp_jump_threshold_seconds": 60.0,
+      "price_gap_threshold": 0.25
     },
     "confidence": {
-      "n_watch_trades": 21491,
+      "n_watch_trades": 1024,
       "entry_rule_precision": 1.0,
-      "entry_rule_recall": 0.10336908629667542,
-      "size_table_bucket_variance": 3.2106381214,
-      "entry_precision": 0.11595855907233153,
-      "entry_recall": 0.11353589874831324,
-      "size_mape": 275.54979878174606
+      "entry_rule_recall": 0.06317300789662599,
+      "size_table_bucket_variance": 11.583408173834878,
+      "entry_precision": 0.0,
+      "entry_recall": 0.0,
+      "size_mape": 0.0
     }
   },
   "BTC_15m": {
     "entry_params": {
-      "up_price_min": 0.01,
-      "up_price_max": 0.995,
-      "down_price_min": 0.01,
-      "down_price_max": 0.995,
+      "up_price_min": 0.035,
+      "up_price_max": 0.975,
+      "down_price_min": 0.015,
+      "down_price_max": 0.975,
       "momentum_window_s": 5.0,
       "momentum_threshold": 0.0,
       "mode": "none"
@@ -240,175 +424,115 @@
         1.0
       ],
       "size_table": {
-        "(-0.001, 0.05]": 7.0,
-        "(0.05, 0.1]": 6.95,
-        "(0.1, 0.15]": 6.74,
-        "(0.15, 0.2]": 6.0723,
-        "(0.2, 0.25]": 6.0,
-        "(0.25, 0.3]": 6.6,
-        "(0.3, 0.35]": 7.0,
-        "(0.35, 0.4]": 8.0,
-        "(0.4, 0.45]": 8.0,
-        "(0.45, 0.5]": 8.12,
-        "(0.5, 0.55]": 9.0,
-        "(0.55, 0.6]": 9.0,
-        "(0.6, 0.65]": 10.0,
-        "(0.65, 0.7]": 10.0,
-        "(0.7, 0.75]": 10.34,
-        "(0.75, 0.8]": 10.0,
-        "(0.8, 0.85]": 10.0,
-        "(0.85, 0.9]": 10.0,
-        "(0.9, 0.95]": 13.5,
-        "(0.95, 1.0]": 15.0
+        "(-0.001, 0.05]": 10.1031,
+        "(0.05, 0.1]": 5.0,
+        "(0.1, 0.15]": 8.5,
+        "(0.15, 0.2]": 6.3,
+        "(0.2, 0.25]": 7.92,
+        "(0.25, 0.3]": 6.0,
+        "(0.3, 0.35]": 5.0694,
+        "(0.35, 0.4]": 5.0,
+        "(0.4, 0.45]": 12.0,
+        "(0.45, 0.5]": 7.3571,
+        "(0.55, 0.6]": 5.0,
+        "(0.6, 0.65]": 4.56,
+        "(0.65, 0.7]": 13.51,
+        "(0.7, 0.75]": 7.3,
+        "(0.75, 0.8]": 6.93,
+        "(0.8, 0.85]": 11.1765,
+        "(0.85, 0.9]": 21.0,
+        "(0.9, 0.95]": 15.0,
+        "(0.95, 1.0]": 19.0
       },
       "size_table_mean": {
-        "(-0.001, 0.05]": 10.05431230486685,
-        "(0.05, 0.1]": 10.466985169326586,
-        "(0.1, 0.15]": 10.001585194514414,
-        "(0.15, 0.2]": 10.171948739873988,
-        "(0.2, 0.25]": 9.635113273631841,
-        "(0.25, 0.3]": 10.264373784087713,
-        "(0.3, 0.35]": 10.538334362307067,
-        "(0.35, 0.4]": 11.037229973984843,
-        "(0.4, 0.45]": 11.204562055628703,
-        "(0.45, 0.5]": 11.606243876622841,
-        "(0.5, 0.55]": 11.932330717533109,
-        "(0.55, 0.6]": 11.95467973886471,
-        "(0.6, 0.65]": 13.13158078528366,
-        "(0.65, 0.7]": 13.249636894537959,
-        "(0.7, 0.75]": 13.419863067190228,
-        "(0.75, 0.8]": 12.780660781880236,
-        "(0.8, 0.85]": 13.025240296204876,
-        "(0.85, 0.9]": 12.650527770300583,
-        "(0.9, 0.95]": 14.122338380513495,
-        "(0.95, 1.0]": 13.240012974051897
+        "(-0.001, 0.05]": 9.981499999999999,
+        "(0.05, 0.1]": 9.304163157894738,
+        "(0.1, 0.15]": 11.566209696969697,
+        "(0.15, 0.2]": 10.51630462962963,
+        "(0.2, 0.25]": 9.613853846153846,
+        "(0.25, 0.3]": 8.831498921832884,
+        "(0.3, 0.35]": 8.604834006734006,
+        "(0.35, 0.4]": 5.921428571428571,
+        "(0.4, 0.45]": 14.28676690140845,
+        "(0.45, 0.5]": 7.3571,
+        "(0.55, 0.6]": 7.6421552238805965,
+        "(0.6, 0.65]": 11.308154545454544,
+        "(0.65, 0.7]": 15.524348421052633,
+        "(0.7, 0.75]": 13.311693333333334,
+        "(0.75, 0.8]": 10.82174245283019,
+        "(0.8, 0.85]": 12.602916129032257,
+        "(0.85, 0.9]": 16.680898876404495,
+        "(0.9, 0.95]": 14.65313125,
+        "(0.95, 1.0]": 18.666674999999998
       },
       "conditioning_var": null
     },
     "inventory_params": {
-      "rebalance_ratio_R": 0.7548739025195197,
-      "max_up_shares": 667720.2540999901,
-      "max_down_shares": 650520.8244999977,
-      "max_total_shares": 1318241.0785999878
+      "rebalance_ratio_R": 0.2089254015403328,
+      "max_up_shares": 16030.644200000008,
+      "max_down_shares": 9757.837599999995,
+      "max_total_shares": 25788.4818
     },
     "cadence_params": {
       "min_inter_trade_ms": 0.0,
       "p50_inter_trade_ms": 0.0,
       "p95_inter_trade_ms": 2000.0,
-      "max_trades_per_sec": 361,
-      "max_trades_per_min": 1238
+      "max_trades_per_sec": 225,
+      "max_trades_per_min": 698
+    },
+    "side_selection_params": {
+      "mode": "inventory_driven",
+      "inventory_driven_score": 0.33319519270617487,
+      "alternation_score": 0.05306799336650083,
+      "edge_driven_score": 0.25694156651471195,
+      "fixed_preference_score": 0.6203895565685869,
+      "preferred_side": null
+    },
+    "execution_params": {
+      "model_type": "mid_price",
+      "fill_bias_median": -0.014999999999999958,
+      "fill_bias_mean": -0.012434231247409855,
+      "fill_bias_std": 0.04002448573239836,
+      "fill_bias_p25": -0.020000000000000018,
+      "fill_bias_p75": 0.0050000000000000044,
+      "slippage_offset": 0.0
+    },
+    "cooldown_params": {
+      "has_time_cooldown": false,
+      "time_cooldown_seconds": 0.0,
+      "price_move_threshold": null,
+      "has_inventory_lockout": false,
+      "inventory_lockout_threshold": null
+    },
+    "risk_params": {
+      "max_trades_per_session": 1810,
+      "max_imbalance_ratio": 1.0,
+      "max_exposure_up_shares": 16030.6442,
+      "max_exposure_down_shares": 9757.837599999999
+    },
+    "unwind_params": {
+      "has_unwind": false,
+      "unwind_start_ratio": null,
+      "reduces_without_rebalance": false
+    },
+    "reset_params": {
+      "resets_on_market_switch": true,
+      "resets_on_inactivity": false,
+      "inactivity_threshold_hours": 0.5
+    },
+    "quality_filter_params": {
+      "max_price_sum_deviation": 0.05,
+      "timestamp_jump_threshold_seconds": 60.0,
+      "price_gap_threshold": 0.295
     },
     "confidence": {
-      "n_watch_trades": 114022,
+      "n_watch_trades": 2413,
       "entry_rule_precision": 1.0,
-      "entry_rule_recall": 0.3566424144435462,
-      "size_table_bucket_variance": 5.305151171275,
-      "entry_precision": 0.6809678510566325,
-      "entry_recall": 0.9357141604251811,
-      "size_mape": 312.2905043953541
-    }
-  },
-  "ETH_1h": {
-    "entry_params": {
-      "up_price_min": 0.001,
-      "up_price_max": 0.98,
-      "down_price_min": 0.025,
-      "down_price_max": 0.999,
-      "momentum_window_s": 5.0,
-      "momentum_threshold": 0.0,
-      "mode": "none"
-    },
-    "size_params": {
-      "bin_edges": [
-        0.0,
-        0.05,
-        0.1,
-        0.15000000000000002,
-        0.2,
-        0.25,
-        0.30000000000000004,
-        0.35000000000000003,
-        0.4,
-        0.45,
-        0.5,
-        0.55,
-        0.6000000000000001,
-        0.65,
-        0.7000000000000001,
-        0.75,
-        0.8,
-        0.8500000000000001,
-        0.9,
-        0.9500000000000001,
-        1.0
-      ],
-      "size_table": {
-        "(-0.001, 0.05]": 3.3131,
-        "(0.05, 0.1]": 5.0,
-        "(0.1, 0.15]": 7.0,
-        "(0.15, 0.2]": 8.0,
-        "(0.2, 0.25]": 7.5949,
-        "(0.25, 0.3]": 7.0,
-        "(0.3, 0.35]": 6.0,
-        "(0.35, 0.4]": 7.545,
-        "(0.4, 0.45]": 8.0,
-        "(0.45, 0.5]": 7.03,
-        "(0.5, 0.55]": 8.0,
-        "(0.55, 0.6]": 8.0,
-        "(0.6, 0.65]": 7.875,
-        "(0.65, 0.7]": 6.0,
-        "(0.7, 0.75]": 8.0,
-        "(0.75, 0.8]": 9.0,
-        "(0.8, 0.85]": 6.3333,
-        "(0.85, 0.9]": 6.0,
-        "(0.9, 0.95]": 8.0,
-        "(0.95, 1.0]": 7.0
-      },
-      "size_table_mean": {
-        "(-0.001, 0.05]": 4.65636,
-        "(0.05, 0.1]": 4.7364902439024394,
-        "(0.1, 0.15]": 6.932315094339622,
-        "(0.15, 0.2]": 6.9031164383561645,
-        "(0.2, 0.25]": 6.65824693877551,
-        "(0.25, 0.3]": 6.681238235294118,
-        "(0.3, 0.35]": 6.208156279069767,
-        "(0.35, 0.4]": 6.5678347517730495,
-        "(0.4, 0.45]": 6.703999574468085,
-        "(0.45, 0.5]": 6.322887409200969,
-        "(0.5, 0.55]": 6.755075675675676,
-        "(0.55, 0.6]": 6.956117921146954,
-        "(0.6, 0.65]": 6.737014772727273,
-        "(0.65, 0.7]": 5.974674576271187,
-        "(0.7, 0.75]": 7.022328682170543,
-        "(0.75, 0.8]": 7.06870206185567,
-        "(0.8, 0.85]": 5.966090277777777,
-        "(0.85, 0.9]": 5.511868518518519,
-        "(0.9, 0.95]": 7.773333333333333,
-        "(0.95, 1.0]": 7.5625
-      },
-      "conditioning_var": null
-    },
-    "inventory_params": {
-      "rebalance_ratio_R": 0.2923076923076923,
-      "max_up_shares": 10893.675800000008,
-      "max_down_shares": 9850.991299999981,
-      "max_total_shares": 20744.66709999999
-    },
-    "cadence_params": {
-      "min_inter_trade_ms": 0.0,
-      "p50_inter_trade_ms": 0.0,
-      "p95_inter_trade_ms": 52000.0,
-      "max_trades_per_sec": 36,
-      "max_trades_per_min": 49
-    },
-    "confidence": {
-      "n_watch_trades": 3169,
-      "entry_rule_precision": 1.0,
-      "entry_rule_recall": 0.06895103720500546,
-      "size_table_bucket_variance": 1.621564086275,
-      "entry_precision": 0.06600071352122726,
-      "entry_recall": 0.05837803723572105,
-      "size_mape": 2139.4680407883125
+      "entry_rule_recall": 0.260302556077204,
+      "size_table_bucket_variance": 22.332211725096954,
+      "entry_precision": 0.3164407778432528,
+      "entry_recall": 0.4450891007045172,
+      "size_mape": 322.3252307352367
     }
   }
 }

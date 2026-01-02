@@ -246,8 +246,8 @@ class PolicyIntegrator {
             };
         }
 
-        // Get size
-        const shares = policyEngine.sizeForTrade(state, features, marketParams.size_params, selectedSide);
+        // Get size (with inventory for conditioning)
+        const shares = policyEngine.sizeForTrade(state, features, marketParams.size_params, selectedSide, inventory);
 
         // Check inventory and rebalance
         const finalSide = policyEngine.inventoryOkAndRebalance(
@@ -347,4 +347,3 @@ class PolicyIntegrator {
 
 // Singleton instance
 export const policyIntegrator = new PolicyIntegrator();
-

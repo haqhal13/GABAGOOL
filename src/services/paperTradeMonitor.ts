@@ -26,6 +26,7 @@ import priceStreamLogger from './priceStreamLogger';
 import { policyIntegrator } from './policyIntegrator';
 import { getParamLoader } from './paramLoader';
 import { policyEngine, TapeState } from './policyEngine';
+import { sizeScaler } from './sizeScaler';
 
 // Debug log file for paper mode (won't be cleared by screen refresh)
 const debugLogPath = path.join(process.cwd(), 'logs', 'paper_debug.log');
@@ -1531,6 +1532,7 @@ async function buildPositionIncrementally(market: typeof discoveredMarkets exten
     // ==========================================================================
     const paramMarketKey = getParamMarketKey(market.marketKey);
     const marketParams = paramLoader.getMarketParams(market.marketKey);
+    const sizeScale = sizeScaler.getScale(paramMarketKey);
 
     let sharesUp = 0;
     let sharesDown = 0;
@@ -1594,7 +1596,8 @@ async function buildPositionIncrementally(market: typeof discoveredMarkets exten
         debugLog(`[Policy UP Check] ${market.marketKey}: should_trade=${upEntrySignal.should_trade}, reason="${upEntrySignal.reason}", price=${market.priceUp?.toFixed(3)} (min=${marketParams.entry_params.up_price_min}, max=${marketParams.entry_params.up_price_max})`);
         
         if (upEntrySignal.should_trade && upEntrySignal.side === 'UP') {
-            const upShares = policyEngine.sizeForTrade(tapeState, features, marketParams.size_params, 'UP');
+            const rawUpShares = policyEngine.sizeForTrade(tapeState, features, marketParams.size_params, 'UP', inventoryState);
+            const upShares = rawUpShares * sizeScale;
             // Pass order book prices and avg costs to determine winning side
             const upFinalSide = policyEngine.inventoryOkAndRebalance(
                 inventoryState, 
@@ -1623,7 +1626,8 @@ async function buildPositionIncrementally(market: typeof discoveredMarkets exten
         debugLog(`[Policy DOWN Check] ${market.marketKey}: should_trade=${downEntrySignal.should_trade}, reason="${downEntrySignal.reason}", price=${market.priceDown?.toFixed(3)} (min=${marketParams.entry_params.down_price_min}, max=${marketParams.entry_params.down_price_max})`);
         
         if (downEntrySignal.should_trade && downEntrySignal.side === 'DOWN') {
-            const downShares = policyEngine.sizeForTrade(tapeState, features, marketParams.size_params, 'DOWN');
+            const rawDownShares = policyEngine.sizeForTrade(tapeState, features, marketParams.size_params, 'DOWN', inventoryState);
+            const downShares = rawDownShares * sizeScale;
             // Pass order book prices and avg costs to determine winning side
             const downFinalSide = policyEngine.inventoryOkAndRebalance(
                 inventoryState, 

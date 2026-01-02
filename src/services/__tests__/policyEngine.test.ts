@@ -33,12 +33,14 @@ describe('PolicyEngine', () => {
 
             const features = { distance_from_50: 0.15 };
 
+            const inventory: InventoryState = { inv_up_shares: 0, inv_down_shares: 0 };
+            
             // UP side at 0.35 should map to bucket (0.2, 0.4] = 10.0
-            const sizeUp = engine.sizeForTrade(state, features, sizeParams, 'UP');
+            const sizeUp = engine.sizeForTrade(state, features, sizeParams, 'UP', inventory);
             expect(sizeUp).toBe(10.0);
 
             // DOWN side at 0.65 should map to bucket (0.6, 0.8] = 20.0
-            const sizeDown = engine.sizeForTrade(state, features, sizeParams, 'DOWN');
+            const sizeDown = engine.sizeForTrade(state, features, sizeParams, 'DOWN', inventory);
             expect(sizeDown).toBe(20.0);
         });
 
@@ -60,8 +62,10 @@ describe('PolicyEngine', () => {
 
             const features = { distance_from_50: 0.0 };
 
+            const inventory: InventoryState = { inv_up_shares: 0, inv_down_shares: 0 };
+            
             // Exactly at boundary should map to first bucket
-            const size = engine.sizeForTrade(state, features, sizeParams, 'UP');
+            const size = engine.sizeForTrade(state, features, sizeParams, 'UP', inventory);
             expect(size).toBe(12.0);
         });
 
@@ -91,11 +95,13 @@ describe('PolicyEngine', () => {
 
             const features = { distance_from_50: 0.4 };
 
+            const inventory: InventoryState = { inv_up_shares: 0, inv_down_shares: 0 };
+            
             // Should use nearest bucket
-            const sizeLow = engine.sizeForTrade(stateLow, features, sizeParams, 'UP');
+            const sizeLow = engine.sizeForTrade(stateLow, features, sizeParams, 'UP', inventory);
             expect(sizeLow).toBe(10.0); // First bucket
 
-            const sizeHigh = engine.sizeForTrade(stateHigh, features, sizeParams, 'UP');
+            const sizeHigh = engine.sizeForTrade(stateHigh, features, sizeParams, 'UP', inventory);
             expect(sizeHigh).toBe(20.0); // Last bucket
         });
 
@@ -123,7 +129,9 @@ describe('PolicyEngine', () => {
                 size_table: {} // Empty table
             };
 
-            const size = engine.sizeForTrade(state, features, sizeParamsMissingKey, 'UP');
+            const inventory: InventoryState = { inv_up_shares: 0, inv_down_shares: 0 };
+            
+            const size = engine.sizeForTrade(state, features, sizeParamsMissingKey, 'UP', inventory);
             expect(size).toBe(1.0); // Default fallback
         });
 
@@ -137,7 +145,9 @@ describe('PolicyEngine', () => {
 
             const features = { distance_from_50: 0.0 };
 
-            const size = engine.sizeForTrade(state, features, undefined, 'UP');
+            const inventory: InventoryState = { inv_up_shares: 0, inv_down_shares: 0 };
+            
+            const size = engine.sizeForTrade(state, features, undefined, 'UP', inventory);
             expect(size).toBe(1.0);
         });
 
@@ -158,7 +168,9 @@ describe('PolicyEngine', () => {
 
             const features = { distance_from_50: 0.0 };
 
-            const size = engine.sizeForTrade(state, features, sizeParams, 'UP');
+            const inventory: InventoryState = { inv_up_shares: 0, inv_down_shares: 0 };
+            
+            const size = engine.sizeForTrade(state, features, sizeParams, 'UP', inventory);
             expect(size).toBe(12.1235); // Rounded to 4 decimals
         });
     });

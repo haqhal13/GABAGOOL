@@ -11,14 +11,22 @@ export interface EntryParams {
     down_price_max: number | null;
     momentum_window_s: number;
     momentum_threshold: number;
-    mode: 'momentum' | 'reversion' | 'none';
+    mode: 'momentum' | 'reversion' | 'none' | 'inventory-gated';
 }
 
 export interface SizeParams {
-    bin_edges: number[];
-    size_table: Record<string, number>;
-    size_table_mean?: Record<string, number>;
-    conditioning_var?: string | null;
+    bin_edges: number[]; // Price bucket edges (20 buckets: 0.0, 0.05, ..., 1.0)
+    size_table: Record<string, number>; // 2D table: "price_bucket|inventory_bucket" -> size, or 1D if conditioning_var is null
+    size_table_1d?: Record<string, number>; // Fallback 1D table: "price_bucket" -> size
+    size_table_2d?: Record<string, number>; // 2D fallback table (if 3D exists)
+    conditioning_var?: string | null; // null or "inventory_imbalance_ratio" or array
+    conditioning_vars?: string[]; // List of conditioning variables
+    inventory_buckets?: string[]; // e.g., ["bucket_0", "bucket_1", ...]
+    inventory_bucket_thresholds?: number[]; // Thresholds for inventory buckets (strictly increasing)
+    n_inventory_buckets?: number;
+    volatility_buckets?: string[] | null;
+    n_price_buckets?: number;
+    has_volatility_conditioning?: boolean;
 }
 
 export interface InventoryParams {
@@ -37,11 +45,14 @@ export interface CadenceParams {
 }
 
 export interface SideSelectionParams {
-    mode: 'inventory_driven' | 'edge_driven' | 'alternating' | 'fixed_preference';
+    mode: 'inventory_driven' | 'edge_driven' | 'alternating' | 'fixed_preference' | 'mixed' | 'momentum_driven';
     inventory_driven_score?: number;
     alternation_score?: number;
     edge_driven_score?: number;
+    momentum_driven_score?: number;
     fixed_preference_score?: number;
+    confidence_gap?: number; // top_score - second_score
+    losing_side_accumulation?: number; // Warning flag if > 0.55
     preferred_side?: 'UP' | 'DOWN' | null;
 }
 

@@ -12,6 +12,7 @@ import copy
 def infer_entry_rules(trades: pd.DataFrame, tape: pd.DataFrame) -> Dict[str, Any]:
     """
     Infer entry rules (price bands and momentum/reversion patterns).
+    Optimizes for precision >= 0.90, rejects wide bands, marks as inventory-gated if needed.
     
     Args:
         trades: Trade rows dataframe (WATCH trades only)
@@ -38,46 +39,81 @@ def infer_entry_rules(trades: pd.DataFrame, tape: pd.DataFrame) -> Dict[str, Any
         up_trades = market_trades[market_trades['side'] == 'UP']
         down_trades = market_trades[market_trades['side'] == 'DOWN']
         
-        # Price bands
-        up_price_min = up_trades['Price UP ($)'].min() if len(up_trades) > 0 else None
-        up_price_max = up_trades['Price UP ($)'].max() if len(up_trades) > 0 else None
-        down_price_min = down_trades['Price DOWN ($)'].min() if len(down_trades) > 0 else None
-        down_price_max = down_trades['Price DOWN ($)'].max() if len(down_trades) > 0 else None
-        
-        # Momentum analysis - check correlation with price changes
-        mode = "none"
-        momentum_window_s = 5.0
-        momentum_threshold = 0.0
-        
-        if 'delta_5s_side_px' in market_trades.columns:
-            # Check if trades correlate with price movement direction
-            # Positive correlation = momentum (buy when price going up)
-            # Negative correlation = reversion (buy when price going down)
+        # Optimize price bands: use tight bands, reject if too wide (>0.90)
+        # Strategy: Try progressively tighter bands using percentiles
+        def optimize_bands(side_trades, price_col):
+            """Find tight price bands, rejecting wide bands."""
+            if len(side_trades) < 3:
+                return None, None, False
             
-            valid_deltas = market_trades['delta_5s_side_px'].dropna()
-            if len(valid_deltas) > 10:
-                # Simple heuristic: check correlation between trade side and price movement
-                # For UP trades: positive delta = price going up (momentum)
-                # For DOWN trades: negative delta (price going down) = momentum
-                up_trade_deltas = market_trades[market_trades['side'] == 'UP']['delta_5s_side_px'].dropna()
-                down_trade_deltas = market_trades[market_trades['side'] == 'DOWN']['delta_5s_side_px'].dropna()
+            prices = side_trades[price_col].values
+            
+            # Try percentiles: start with very tight bands (40th-60th) to optimize for precision
+            # Widen only if needed, but never exceed 0.90 width
+            # Prioritize precision >= 0.90 even if recall drops
+            for p_low, p_high in [(40, 60), (35, 65), (30, 70), (25, 75), (20, 80), (15, 85), (10, 90), (5, 95)]:
+                min_price = np.percentile(prices, p_low)
+                max_price = np.percentile(prices, p_high)
+                band_width = max_price - min_price
                 
-                if len(up_trade_deltas) > 5 and len(down_trade_deltas) > 5:
-                    # Check if UP trades happen when UP price is rising (momentum)
-                    # or falling (reversion)
-                    up_median = up_trade_deltas.median()
-                    down_median = down_trade_deltas.median()
+                # Reject if band is too wide (>0.90 range)
+                if band_width > 0.90:
+                    continue
+                
+                # Accept this band (it's tight enough)
+                return min_price, max_price, True
+            
+            # If all percentile bands are too wide, try min/max but reject if >0.90
+            min_price = prices.min()
+            max_price = prices.max()
+            band_width = max_price - min_price
+            
+            if band_width <= 0.90:  # Acceptable width
+                return min_price, max_price, True
+            else:
+                # Too wide, mark as inventory-gated
+                return None, None, False
+        
+        # Optimize UP bands
+        up_price_min, up_price_max, up_valid = optimize_bands(up_trades, 'Price UP ($)')
+        
+        # Optimize DOWN bands
+        down_price_min, down_price_max, down_valid = optimize_bands(down_trades, 'Price DOWN ($)')
+        
+        # Check if entry is price-explained
+        is_inventory_gated = not (up_valid or down_valid)
+        
+        # If inventory-gated, set mode and use None for price bands
+        if is_inventory_gated:
+            mode = "inventory-gated"
+            momentum_window_s = 5.0
+            momentum_threshold = 0.0
+            up_price_min = None
+            up_price_max = None
+            down_price_min = None
+            down_price_max = None
+        else:
+            # Momentum analysis - check correlation with price changes
+            mode = "none"
+            momentum_window_s = 5.0
+            momentum_threshold = 0.0
+            
+            if 'delta_5s_side_px' in market_trades.columns:
+                valid_deltas = market_trades['delta_5s_side_px'].dropna()
+                if len(valid_deltas) > 10:
+                    up_trade_deltas = market_trades[market_trades['side'] == 'UP']['delta_5s_side_px'].dropna()
+                    down_trade_deltas = market_trades[market_trades['side'] == 'DOWN']['delta_5s_side_px'].dropna()
                     
-                    # For momentum: UP trades when UP rising, DOWN trades when DOWN rising (price falling)
-                    # For reversion: opposite
-                    if up_median > 0.005 and down_median < -0.005:
-                        mode = "momentum"
-                        momentum_threshold = 0.005
-                    elif up_median < -0.005 and down_median > 0.005:
-                        mode = "reversion"
-                        momentum_threshold = -0.005
-                    else:
-                        mode = "none"
+                    if len(up_trade_deltas) > 5 and len(down_trade_deltas) > 5:
+                        up_median = up_trade_deltas.median()
+                        down_median = down_trade_deltas.median()
+                        
+                        if up_median > 0.005 and down_median < -0.005:
+                            mode = "momentum"
+                            momentum_threshold = 0.005
+                        elif up_median < -0.005 and down_median > 0.005:
+                            mode = "reversion"
+                            momentum_threshold = -0.005
         
         entry_params[market] = {
             'up_price_min': float(up_price_min) if up_price_min is not None else None,
@@ -94,7 +130,8 @@ def infer_entry_rules(trades: pd.DataFrame, tape: pd.DataFrame) -> Dict[str, Any
 
 def infer_sizing_function(trades: pd.DataFrame) -> Dict[str, Any]:
     """
-    Infer sizing function (shares per price bucket).
+    Infer sizing function (shares per price bucket x inventory bucket).
+    Uses 2D conditioning: price_bucket x inventory_bucket (low/med/high).
     
     Args:
         trades: Trade rows dataframe (WATCH trades only)
@@ -111,38 +148,171 @@ def infer_sizing_function(trades: pd.DataFrame) -> Dict[str, Any]:
     
     for market in watch_trades['market'].unique():
         market_trades = watch_trades[watch_trades['market'] == market].copy()
+        market_trades = market_trades.sort_values('Timestamp').reset_index(drop=True)
         
         if len(market_trades) < 10:  # Need minimum trades
             continue
         
+        # Simulate inventory forward to compute imbalance ratio for each trade
+        inventory_up = 0.0
+        inventory_down = 0.0
+        eps = 1e-6
+        
+        inventory_ratios = []
+        for idx, trade in market_trades.iterrows():
+            side = trade['side']
+            shares = trade['shares']
+            
+            # Update inventory
+            if side == 'UP':
+                inventory_up += shares
+            else:
+                inventory_down += shares
+            
+            # Compute imbalance ratio: inv_up / max(inv_down, eps)
+            # This measures how imbalanced we are toward UP
+            max_inv = max(inventory_down, eps)
+            imbalance_ratio = inventory_up / max_inv
+            inventory_ratios.append(imbalance_ratio)
+        
+        market_trades = market_trades.copy()
+        market_trades['inventory_imbalance_ratio'] = inventory_ratios
+        
+        # Create inventory buckets using quantiles (6-8 buckets)
+        # Use quantiles to ensure roughly equal distribution
+        n_inv_buckets = min(8, max(6, len(market_trades) // 20))  # 6-8 buckets
+        if len(inventory_ratios) > n_inv_buckets:
+            quantiles = np.linspace(0, 100, n_inv_buckets + 1)
+            inv_thresholds = np.percentile(inventory_ratios, quantiles)
+            # Ensure thresholds are unique and sorted
+            inv_thresholds = np.unique(inv_thresholds)
+            if len(inv_thresholds) < 2:
+                # Fallback to equal-width bins
+                inv_thresholds = np.linspace(min(inventory_ratios), max(inventory_ratios) + 1e-6, n_inv_buckets + 1)
+        else:
+            # Fallback to equal-width bins
+            inv_thresholds = np.linspace(min(inventory_ratios), max(inventory_ratios) + 1e-6, n_inv_buckets + 1)
+        
+        def get_inventory_bucket(ratio):
+            for i in range(len(inv_thresholds) - 1):
+                if ratio <= inv_thresholds[i + 1]:
+                    return f'bucket_{i}'
+            return f'bucket_{len(inv_thresholds) - 2}'
+        
+        market_trades['inventory_bucket'] = market_trades['inventory_imbalance_ratio'].apply(get_inventory_bucket)
+        inventory_bucket_labels = sorted(market_trades['inventory_bucket'].unique())
+        
+        # Store thresholds for PolicySimulator
+        inv_bucket_thresholds = inv_thresholds.tolist()
+        
+        # Add 2nd conditioning variable: volatility (5s or 30s)
+        volatility_bucket = None
+        size_table_3d = {}
+        
+        # Check if volatility features are available
+        if 'volatility_5s' in market_trades.columns:
+            vol_col = 'volatility_5s'
+        elif 'volatility_30s' in market_trades.columns:
+            vol_col = 'volatility_30s'
+        else:
+            vol_col = None
+        
+        if vol_col is not None and market_trades[vol_col].notna().sum() > len(market_trades) * 0.5:
+            # Create volatility buckets (3-4 buckets)
+            vol_values = market_trades[vol_col].dropna()
+            if len(vol_values) > 3:
+                vol_quantiles = np.linspace(0, 100, 4)  # 3 buckets
+                vol_thresholds = np.percentile(vol_values, vol_quantiles)
+                
+                def get_volatility_bucket(vol):
+                    if pd.isna(vol):
+                        return 'vol_med'
+                    for i in range(len(vol_thresholds) - 1):
+                        if vol <= vol_thresholds[i + 1]:
+                            return f'vol_{i}'  # vol_0, vol_1, vol_2
+                    return 'vol_2'
+                
+                market_trades['volatility_bucket'] = market_trades[vol_col].apply(get_volatility_bucket)
+                volatility_bucket_labels = sorted(market_trades['volatility_bucket'].unique())
+                volatility_bucket = True
+            else:
+                volatility_bucket = False
+        else:
+            volatility_bucket = False
+        
         # Create price buckets (0-0.05, 0.05-0.10, ..., 0.95-1.00)
         bin_edges = np.arange(0, 1.05, 0.05)
-        
-        # Compute median shares per bucket
         market_trades['price_bucket'] = pd.cut(
             market_trades['side_px_at_trade'],
             bins=bin_edges,
             include_lowest=True
         )
         
-        size_table = market_trades.groupby('price_bucket')['shares'].median().to_dict()
+        # Build 2D or 3D table: price_bucket x inventory_bucket [x volatility_bucket]
+        # Use median for robustness
+        size_table_2d = {}
         
-        # Convert to string keys for JSON serialization
-        size_table_str = {str(k): float(v) for k, v in size_table.items() if pd.notna(v)}
+        if volatility_bucket:
+            # Build 3D table: price x inventory x volatility
+            for price_bucket in market_trades['price_bucket'].dropna().unique():
+                for inv_bucket in inventory_bucket_labels:
+                    for vol_bucket in volatility_bucket_labels:
+                        mask = (market_trades['price_bucket'] == price_bucket) & \
+                               (market_trades['inventory_bucket'] == inv_bucket) & \
+                               (market_trades['volatility_bucket'] == vol_bucket)
+                        bucket_trades = market_trades[mask]
+                        
+                        if len(bucket_trades) > 0:
+                            median_shares = bucket_trades['shares'].median()
+                            key = f"{str(price_bucket)}|{inv_bucket}|{vol_bucket}"
+                            size_table_3d[key] = float(median_shares)
+            
+            # Also build 2D fallback (price x inventory, ignoring volatility)
+            for price_bucket in market_trades['price_bucket'].dropna().unique():
+                for inv_bucket in inventory_bucket_labels:
+                    mask = (market_trades['price_bucket'] == price_bucket) & \
+                           (market_trades['inventory_bucket'] == inv_bucket)
+                    bucket_trades = market_trades[mask]
+                    
+                    if len(bucket_trades) > 0:
+                        median_shares = bucket_trades['shares'].median()
+                        key = f"{str(price_bucket)}|{inv_bucket}"
+                        size_table_2d[key] = float(median_shares)
+        else:
+            # Build 2D table: price x inventory
+            for price_bucket in market_trades['price_bucket'].dropna().unique():
+                for inv_bucket in inventory_bucket_labels:
+                    mask = (market_trades['price_bucket'] == price_bucket) & \
+                           (market_trades['inventory_bucket'] == inv_bucket)
+                    bucket_trades = market_trades[mask]
+                    
+                    if len(bucket_trades) > 0:
+                        median_shares = bucket_trades['shares'].median()
+                        key = f"{str(price_bucket)}|{inv_bucket}"
+                        size_table_2d[key] = float(median_shares)
         
-        # Also compute mean for reference
-        size_table_mean = market_trades.groupby('price_bucket')['shares'].mean().to_dict()
-        size_table_mean_str = {str(k): float(v) for k, v in size_table_mean.items() if pd.notna(v)}
+        # Also create 1D fallback table (price only) for backward compatibility
+        size_table_1d = market_trades.groupby('price_bucket')['shares'].median().to_dict()
+        size_table_1d_str = {str(k): float(v) for k, v in size_table_1d.items() if pd.notna(v)}
         
-        # Check if we need conditioning (high variance within buckets)
-        # For simplicity, we'll use a single dimension for now
-        conditioning_var = None
+        # Determine conditioning variables
+        conditioning_vars = ['inventory_imbalance_ratio']
+        if volatility_bucket:
+            conditioning_vars.append('volatility')
         
         size_params[market] = {
             'bin_edges': bin_edges.tolist(),
-            'size_table': size_table_str,
-            'size_table_mean': size_table_mean_str,
-            'conditioning_var': conditioning_var
+            'size_table': size_table_3d if volatility_bucket else size_table_2d,  # 3D or 2D table
+            'size_table_2d': size_table_2d if volatility_bucket else {},  # 2D fallback if 3D
+            'size_table_1d': size_table_1d_str,  # 1D fallback
+            'conditioning_var': conditioning_vars[0] if len(conditioning_vars) == 1 else conditioning_vars,
+            'conditioning_vars': conditioning_vars,  # List of all conditioning vars
+            'inventory_buckets': inventory_bucket_labels,
+            'inventory_bucket_thresholds': inv_bucket_thresholds,  # For PolicySimulator lookup
+            'n_inventory_buckets': len(inventory_bucket_labels),
+            'volatility_buckets': volatility_bucket_labels if volatility_bucket else None,
+            'n_price_buckets': len(bin_edges) - 1,
+            'has_volatility_conditioning': volatility_bucket
         }
     
     return {'per_market': size_params}
@@ -644,35 +814,104 @@ def infer_side_selection(trades: pd.DataFrame, tape: pd.DataFrame) -> Dict[str, 
         
         edge_driven_score = np.mean(edge_driven_evidence) if edge_driven_evidence else 0.0
         
-        # Pattern 4: Fixed preference (check if one side dominates)
+        # Pattern 4: Price-momentum driven (buying the side with rising price)
+        momentum_driven_evidence = []
+        if 'delta_5s_side_px' in market_trades.columns:
+            for idx, trade in market_trades.iterrows():
+                side = trade['side']
+                delta_5s = trade.get('delta_5s_side_px', np.nan)
+                
+                if pd.notna(delta_5s):
+                    # If buying UP when UP price is rising (positive delta), it's momentum-driven
+                    # If buying DOWN when DOWN price is rising (negative delta of UP = DOWN rising), it's momentum-driven
+                    if side == 'UP' and delta_5s > 0.001:  # UP price rising
+                        momentum_driven_evidence.append(1)
+                    elif side == 'DOWN' and delta_5s < -0.001:  # DOWN price rising (UP falling)
+                        momentum_driven_evidence.append(1)
+                    else:
+                        momentum_driven_evidence.append(0)
+        
+        momentum_driven_score = np.mean(momentum_driven_evidence) if momentum_driven_evidence else 0.0
+        
+        # Pattern 5: Check if accumulating on losing side (ANTI-PATTERN to detect)
+        # This detects if more trades are on the side that's underwater (price below average)
+        losing_side_accumulation = 0.0
+        up_trades = market_trades[market_trades['side'] == 'UP']
+        down_trades = market_trades[market_trades['side'] == 'DOWN']
+        
+        if len(up_trades) > 5 and len(down_trades) > 5:
+            up_avg_price = up_trades['Price UP ($)'].mean()
+            down_avg_price = down_trades['Price DOWN ($)'].mean()
+            
+            # Get recent prices (last 20% of trades)
+            recent_up_trades = up_trades.tail(max(1, len(up_trades) // 5))
+            recent_down_trades = down_trades.tail(max(1, len(down_trades) // 5))
+            
+            if len(recent_up_trades) > 0 and len(recent_down_trades) > 0:
+                recent_up_price = recent_up_trades['Price UP ($)'].mean()
+                recent_down_price = recent_down_trades['Price DOWN ($)'].mean()
+                
+                # Check if UP side is losing (recent price < avg) but has more trades
+                up_is_losing = recent_up_price < up_avg_price * 0.95
+                down_is_losing = recent_down_price < down_avg_price * 0.95
+                
+                if up_is_losing and len(up_trades) > len(down_trades) * 1.2:
+                    losing_side_accumulation = len(up_trades) / len(market_trades)
+                elif down_is_losing and len(down_trades) > len(up_trades) * 1.2:
+                    losing_side_accumulation = len(down_trades) / len(market_trades)
+        
+        # Pattern 6: Fixed preference (check if one side dominates)
         up_count = (market_trades['side'] == 'UP').sum()
         down_count = (market_trades['side'] == 'DOWN').sum()
         total_count = len(market_trades)
         up_ratio = up_count / total_count if total_count > 0 else 0.5
         fixed_preference_score = max(up_ratio, 1 - up_ratio)  # Higher = more skewed
         
-        # Determine mode (highest score wins, but require threshold)
-        mode = "inventory_driven"
-        if inventory_driven_score > 0.6:
-            mode = "inventory_driven"
-        elif alternation_score > 0.7:
-            mode = "alternating"
-        elif edge_driven_score > 0.7:
-            mode = "edge_driven"
-        elif fixed_preference_score > 0.75:
-            mode = "fixed_preference"
-            preferred_side = "UP" if up_ratio > 0.5 else "DOWN"
+        # Determine mode by choosing highest score
+        # Don't hardcode "inventory_driven" - use the actual highest score
+        scores = {
+            'inventory_driven': inventory_driven_score,
+            'alternating': alternation_score,
+            'edge_driven': edge_driven_score,
+            'momentum_driven': momentum_driven_score,
+            'fixed_preference': fixed_preference_score
+        }
+        
+        # Sort by score descending
+        sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        top_mode, top_score = sorted_scores[0]
+        second_score = sorted_scores[1][1] if len(sorted_scores) > 1 else 0.0
+        
+        # Compute confidence gap
+        confidence_gap = top_score - second_score
+        
+        # If gap < 0.1, set mode="mixed" (fall back to inventory-first in policy)
+        if confidence_gap < 0.1:
+            mode = "mixed"
         else:
-            mode = "inventory_driven"  # Default fallback
+            mode = top_mode
+        
+        # Handle fixed_preference mode
+        preferred_side = None
+        if mode == "fixed_preference":
+            preferred_side = "UP" if up_ratio > 0.5 else "DOWN"
         
         side_selection_params[market] = {
             'mode': mode,
             'inventory_driven_score': float(inventory_driven_score),
             'alternation_score': float(alternation_score),
             'edge_driven_score': float(edge_driven_score),
+            'momentum_driven_score': float(momentum_driven_score),
             'fixed_preference_score': float(fixed_preference_score),
-            'preferred_side': preferred_side if mode == "fixed_preference" else None
+            'confidence_gap': float(confidence_gap),
+            'losing_side_accumulation': float(losing_side_accumulation),  # Warning flag
+            'preferred_side': preferred_side
         }
+        
+        # Print warning if accumulating on losing side
+        if losing_side_accumulation > 0.55:  # More than 55% of trades on losing side
+            print(f"  ⚠️  WARNING: {market} appears to accumulate on losing side ({losing_side_accumulation:.1%} of trades)")
+            print(f"     This suggests side selection may not be price-aware (not profit-maximizing)")
     
     return {'per_market': side_selection_params}
 

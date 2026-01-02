@@ -67,7 +67,7 @@ def main():
                 value = market_params[param_type]
                 if isinstance(value, dict):
                     if param_type == 'size_params' and 'size_table' in value:
-                        print(f"  {param_type}: {len(value.get('size_table', {}))} buckets")
+                        print(f"  {param_type}: {len(value.get('size_table', {}))} buckets (2D: price x inventory)")
                     elif param_type == 'confidence':
                         conf = value
                         print(f"  {param_type}: n_trades={conf.get('n_watch_trades', 0)}, "
@@ -93,11 +93,63 @@ def main():
             val_metrics = per_market_validation[market]
             params[market]['confidence']['entry_precision'] = val_metrics.get('precision', 0.0)
             params[market]['confidence']['entry_recall'] = val_metrics.get('recall', 0.0)
-            params[market]['confidence']['size_mape'] = val_metrics.get('size_mape', 0.0)
+            size_mape = val_metrics.get('size_mape', 0.0)
+            size_p90_ape = val_metrics.get('size_p90_ape', 0.0)
+            params[market]['confidence']['size_mape'] = size_mape
+            params[market]['confidence']['size_p90_ape'] = size_p90_ape
+            
+            # Check if size model should be rejected (MdAPE > 30%)
+            if size_mape > 30.0:
+                print(f"\n⚠️  WARNING: {market} size model needs improvement - MdAPE = {size_mape:.2f}% > 30%")
+        
+        # Add side_selection_gap from side_selection_params
+        if 'side_selection_params' in params[market]:
+            ss_params = params[market]['side_selection_params']
+            if 'confidence_gap' in ss_params:
+                if 'confidence' not in params[market]:
+                    params[market]['confidence'] = {}
+                params[market]['confidence']['side_selection_gap'] = ss_params['confidence_gap']
     
     # Step 6: Generate reports
     print("\n[6/6] Generating reports...")
     generate_all_reports(tape, trades, params, validation_results, "output")
+    
+    # Print per-market validation metrics summary
+    print("\n" + "=" * 80)
+    print("Per-Market Validation Metrics Summary")
+    print("=" * 80)
+    for market in sorted(params.keys()):
+        conf = params[market].get('confidence', {})
+        size_params = params[market].get('size_params', {})
+        print(f"\n{market}:")
+        print(f"  entry_precision: {conf.get('entry_precision', 0):.2%}")
+        print(f"  entry_recall: {conf.get('entry_recall', 0):.2%}")
+        size_mape = conf.get('size_mape', 0)
+        size_p90_ape = conf.get('size_p90_ape', 0)
+        print(f"  MdAPE (size error): {size_mape:.2f}% (on matched trades: same market, side, ±2000ms)")
+        print(f"  p90 APE: {size_p90_ape:.2f}%")
+        if size_mape > 30.0:
+            print(f"  ⚠️  WARNING: MdAPE > 30% - size model needs improvement")
+        
+        # Bucket counts
+        n_price = size_params.get('n_price_buckets', 0)
+        n_inv = size_params.get('n_inventory_buckets', 0)
+        n_vol = len(size_params.get('volatility_buckets', [])) if size_params.get('volatility_buckets') else 0
+        print(f"  bucket counts: price={n_price}, inventory={n_inv}" + (f", volatility={n_vol}" if n_vol > 0 else ""))
+        
+        conditioning_vars = size_params.get('conditioning_vars', [])
+        if isinstance(conditioning_vars, list):
+            print(f"  conditioning_vars: {', '.join(conditioning_vars)}")
+        else:
+            conditioning_var = size_params.get('conditioning_var', None)
+            if conditioning_var:
+                print(f"  conditioning_var: {conditioning_var}")
+            else:
+                print(f"  conditioning_var: None (⚠️  missing inventory conditioning)")
+        
+        if 'side_selection_gap' in conf:
+            gap = conf.get('side_selection_gap', 0)
+            print(f"  side_selection_gap: {gap:.3f}" + (" (mixed mode: inventory-first tie-break)" if gap < 0.1 else ""))
     
     print("\n" + "=" * 80)
     print("Pipeline Complete!")

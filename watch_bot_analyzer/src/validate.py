@@ -103,28 +103,83 @@ class PolicySimulator:
         return True
     
     def get_size(self, market: str, side: str, side_px: float) -> float:
-        """Get trade size based on price bucket."""
+        """Get trade size based on price bucket x inventory bucket [x volatility bucket] (2D/3D table)."""
         if market not in self.size_params:
             return 1.0  # default
         
         size_params = self.size_params[market]
         size_table = size_params.get('size_table', {})
         
-        # Find appropriate bucket
+        # Find price bucket
         bin_edges = size_params.get('bin_edges', np.arange(0, 1.05, 0.05))
-        
-        # Simple lookup - find bucket containing side_px
         bucket_idx = np.digitize(side_px, bin_edges) - 1
         bucket_idx = max(0, min(bucket_idx, len(bin_edges) - 2))
+        price_bucket = pd.Interval(bin_edges[bucket_idx], bin_edges[bucket_idx + 1])
+        price_bucket_str = str(price_bucket)
         
-        bucket = pd.Interval(bin_edges[bucket_idx], bin_edges[bucket_idx + 1])
+        # Get inventory bucket using quantile thresholds
+        eps = 1e-6
+        if market not in self.inventory_up:
+            self.inventory_up[market] = 0.0
+            self.inventory_down[market] = 0.0
         
-        # Look up size
-        bucket_str = str(bucket)
-        if bucket_str in size_table:
-            return size_table[bucket_str]
+        inv_up = self.inventory_up[market]
+        inv_down = self.inventory_down[market]
+        inventory_ratio = inv_up / max(inv_down, eps)
         
-        # Fallback: use median of all sizes
+        # Determine inventory bucket using thresholds
+        inv_thresholds = size_params.get('inventory_bucket_thresholds', None)
+        if inv_thresholds and len(inv_thresholds) >= 2:
+            inv_bucket_idx = 0
+            for i in range(len(inv_thresholds) - 1):
+                if inventory_ratio <= inv_thresholds[i + 1]:
+                    inv_bucket_idx = i
+                    break
+            else:
+                inv_bucket_idx = len(inv_thresholds) - 2
+            inv_bucket = f'bucket_{inv_bucket_idx}'
+        else:
+            # Fallback to old logic if thresholds not available
+            if inventory_ratio <= 0.8:
+                inv_bucket = 'low'
+            elif inventory_ratio <= 1.25:
+                inv_bucket = 'med_low'
+            elif inventory_ratio <= 2.0:
+                inv_bucket = 'med_high'
+            else:
+                inv_bucket = 'high'
+        
+        # Check if 3D table (with volatility)
+        has_volatility = size_params.get('has_volatility_conditioning', False)
+        if has_volatility:
+            # For 3D, we'd need volatility - skip for now, use 2D fallback
+            size_table_2d = size_params.get('size_table_2d', {})
+            key_2d = f"{price_bucket_str}|{inv_bucket}"
+            if key_2d in size_table_2d:
+                return size_table_2d[key_2d]
+        else:
+            # 2D lookup: price_bucket|inventory_bucket
+            key_2d = f"{price_bucket_str}|{inv_bucket}"
+            if key_2d in size_table:
+                return size_table[key_2d]
+        
+        # Fallback 1: Try other inventory buckets for same price bucket
+        inventory_buckets = size_params.get('inventory_buckets', [])
+        if not inventory_buckets:
+            inventory_buckets = ['bucket_0', 'bucket_1', 'bucket_2', 'bucket_3']  # Fallback
+        
+        for fallback_bucket in inventory_buckets:
+            fallback_key = f"{price_bucket_str}|{fallback_bucket}"
+            fallback_table = size_params.get('size_table_2d', size_table)
+            if fallback_key in fallback_table:
+                return fallback_table[fallback_key]
+        
+        # Fallback 2: Use 1D table if available
+        size_table_1d = size_params.get('size_table_1d', {})
+        if price_bucket_str in size_table_1d:
+            return size_table_1d[price_bucket_str]
+        
+        # Fallback 3: Use median of all sizes
         if size_table:
             return np.median(list(size_table.values()))
         
@@ -242,19 +297,21 @@ def compute_validation_metrics(actual_trades: pd.DataFrame, simulated_trades: pd
         for _, actual_trade in market_actual.iterrows():
             actual_ts = actual_trade['Timestamp']
             
-            # Find nearest simulated trade within ±2s
-            time_diffs = abs(market_sim['Timestamp'] - actual_ts) / 1000.0
-            within_window = time_diffs <= 2.0
+            # Find nearest simulated trade within ±2000ms
+            time_diffs_ms = abs(market_sim['Timestamp'] - actual_ts)
+            within_window = time_diffs_ms <= 2000.0
             
             if within_window.any():
-                nearest_idx = time_diffs[within_window].idxmin()
+                nearest_idx = time_diffs_ms[within_window].idxmin()
                 sim_trade = market_sim.loc[nearest_idx]
                 
                 matched.append({
                     'market': market,
-                    'dt_ms': time_diffs[nearest_idx] * 1000,
+                    'dt_ms': float(time_diffs_ms[nearest_idx]),
                     'same_side': actual_trade['side'] == sim_trade['side'],
                     'size_ratio': sim_trade['shares'] / actual_trade['shares'] if actual_trade['shares'] > 0 else 0,
+                    'actual_shares': actual_trade['shares'],
+                    'sim_shares': sim_trade['shares'],
                     'fill_px_diff': abs(actual_trade.get('fill_px', 0) - sim_trade.get('side_px_at_trade', 0))
                 })
         
@@ -270,15 +327,42 @@ def compute_validation_metrics(actual_trades: pd.DataFrame, simulated_trades: pd
             # Side accuracy
             side_accuracy = matched_df['same_side'].mean() if len(matched_df) > 0 else 0
             
-            # Size error (MAPE)
-            size_mape = (abs(matched_df['size_ratio'] - 1.0).mean() * 100) if len(matched_df) > 0 else 0
+            # Size error: Compute ONLY on matched trades (same market, same side, within ±2000ms)
+            # APE = abs(predicted - actual) / max(abs(actual), eps)
+            # Report as percent (multiply by 100)
+            eps = 1e-6
+            size_percentage_errors = []
+            
+            # Filter to matched trades with same side and within ±2000ms
+            matched_same_side = matched_df[matched_df['same_side'] == True].copy()
+            if len(matched_same_side) > 0:
+                # Already filtered to ±2000ms in matching logic, but double-check
+                matched_same_side = matched_same_side[matched_same_side['dt_ms'] <= 2000.0]
+                
+                for _, row in matched_same_side.iterrows():
+                    actual_shares = row['actual_shares']
+                    sim_shares = row['sim_shares']
+                    
+                    # Use the correct formula: abs(pred-actual) / max(abs(actual), eps)
+                    ape = abs(sim_shares - actual_shares) / max(abs(actual_shares), eps)
+                    size_percentage_errors.append(ape * 100)  # Convert to percent
+            
+            # Compute MdAPE (median) and p90 APE
+            if len(size_percentage_errors) > 0:
+                size_mape = float(np.median(size_percentage_errors))
+                size_p90_ape = float(np.percentile(size_percentage_errors, 90))
+            else:
+                size_mape = 0.0
+                size_p90_ape = 0.0
             
             per_market_metrics[market] = {
                 'recall': float(recall),
                 'precision': float(precision),
                 'side_accuracy': float(side_accuracy),
                 'size_mape': float(size_mape),
+                'size_p90_ape': float(size_p90_ape),
                 'matched_count': len(matched_df),
+                'matched_same_side_count': len(matched_same_side) if len(matched_df) > 0 else 0,
                 'actual_count': len(market_actual),
                 'simulated_count': len(market_sim)
             }
@@ -288,7 +372,9 @@ def compute_validation_metrics(actual_trades: pd.DataFrame, simulated_trades: pd
                 'precision': 0.0,
                 'side_accuracy': 0.0,
                 'size_mape': 0.0,
+                'size_p90_ape': 0.0,
                 'matched_count': 0,
+                'matched_same_side_count': 0,
                 'actual_count': len(market_actual),
                 'simulated_count': len(market_sim)
             }
@@ -385,8 +471,8 @@ def validate_model(tape: pd.DataFrame, trades: pd.DataFrame, params: Dict[str, A
         print(f"\n{market}:")
         print(f"  entry_precision: {m.get('precision', 0):.2%}")
         print(f"  entry_recall: {m.get('recall', 0):.2%}")
-        print(f"  size_MAPE: {m.get('size_mape', 0):.2f}%")
-        print(f"  matched_count: {m.get('matched_count', 0)} / {m.get('actual_count', 0)}")
+        print(f"  MdAPE: {m.get('size_mape', 0):.2f}%, p90 APE: {m.get('size_p90_ape', 0):.2f}%")
+        print(f"  matched_count: {m.get('matched_count', 0)} / {m.get('actual_count', 0)} (same_side: {m.get('matched_same_side_count', 0)})")
     
     # Print global summary
     global_metrics = metrics.get('global', {})

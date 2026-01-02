@@ -293,207 +293,212 @@ export class PolicyEngine {
 
     /**
      * Get trade size based on size parameters
-     * Now includes price-ratio-based multiplier: trade more on winning side as ratio moves from 50:50
+     * Exact implementation:
+     * - Price bucket selection using size_params.bin_edges (20 buckets)
+     * - If conditioning_var is null: use size_table_1d
+     * - If conditioning_var == "inventory_imbalance_ratio":
+     *   * compute current imbalance ratio identically to watch mode
+     *   * bucket it using inventory_bucket_thresholds
+     *   * select size_table["(price_bin]|bucket_k"] keys
+     *   * fall back to size_table_1d only if the 2D key is missing
      */
     sizeForTrade(
         state: TapeState,
         features: Features,
         sizeParams: SizeParams | undefined,
-        side: 'UP' | 'DOWN'
+        side: 'UP' | 'DOWN',
+        inventory: InventoryState
     ): number {
-        if (!sizeParams || !sizeParams.size_table || Object.keys(sizeParams.size_table).length === 0) {
+        if (!sizeParams) {
             return 1.0; // Default size
         }
 
         const sidePx = side === 'UP' ? state.up_px : state.down_px;
         const binEdges = sizeParams.bin_edges || [];
 
-        // Find bucket containing sidePx
-        let bucketIndex = -1;
+        // Validate bin_edges are strictly increasing
+        if (binEdges.length < 2) {
+            return 1.0;
+        }
+
+        // Find price bucket containing sidePx
+        let priceBucketIndex = -1;
         for (let i = 0; i < binEdges.length - 1; i++) {
-            if (sidePx >= binEdges[i] && sidePx <= binEdges[i + 1]) {
-                bucketIndex = i;
+            // Handle edge cases: first bucket includes left edge
+            const leftEdge = i === 0 ? -0.001 : binEdges[i];
+            const rightEdge = binEdges[i + 1];
+            if (sidePx > leftEdge && sidePx <= rightEdge) {
+                priceBucketIndex = i;
                 break;
             }
         }
 
-        if (bucketIndex === -1) {
-            // Outside range, use nearest bucket
-            if (sidePx < binEdges[0]) bucketIndex = 0;
-            else bucketIndex = binEdges.length - 2;
+        if (priceBucketIndex === -1) {
+            // Outside range, clamp to nearest bucket
+            if (sidePx <= binEdges[0]) priceBucketIndex = 0;
+            else priceBucketIndex = binEdges.length - 2;
         }
 
-        // Construct bucket key (format matches pandas Interval string representation)
-        const bucketKey = `(${binEdges[bucketIndex]}, ${binEdges[bucketIndex + 1]}]`;
+        // Construct price bucket key (format: "(left, right]")
+        const priceBucketKey = priceBucketIndex === 0 
+            ? `(-0.001, ${binEdges[1]}]`
+            : `(${binEdges[priceBucketIndex]}, ${binEdges[priceBucketIndex + 1]}]`;
 
-        // Get base size from table
-        let baseSize: number;
-        if (sizeParams.size_table[bucketKey] !== undefined) {
-            baseSize = parseFloat(sizeParams.size_table[bucketKey].toFixed(4));
-        } else {
-            // Fallback: use median of all sizes
-            const allSizes = Object.values(sizeParams.size_table);
+        // Check if conditioning_var is null -> use 1D table
+        const conditioningVar = sizeParams.conditioning_var;
+        if (!conditioningVar || conditioningVar === null) {
+            // Use size_table_1d
+            const sizeTable1d = sizeParams.size_table_1d || {};
+            if (sizeTable1d[priceBucketKey] !== undefined) {
+                return sizeTable1d[priceBucketKey];
+            }
+            // Fallback: try size_table as 1D (if keys don't contain "|")
+            const sizeTable = sizeParams.size_table || {};
+            if (sizeTable[priceBucketKey] !== undefined) {
+                return sizeTable[priceBucketKey];
+            }
+            // Final fallback: median of all sizes
+            const allSizes = Object.values(sizeTable);
             if (allSizes.length > 0) {
                 const sorted = allSizes.sort((a, b) => a - b);
-                baseSize = sorted[Math.floor(sorted.length / 2)];
-            } else {
-                return 1.0; // Final fallback
+                return sorted[Math.floor(sorted.length / 2)];
             }
+            return 1.0;
         }
 
-        // ==========================================================================
-        // PRICE-RATIO-BASED MULTIPLIER: Trade more on winning side as ratio moves from 50:50
-        // 55:45 → 1.1x (slightly more)
-        // 60:40 → 1.3x (more)
-        // 70:30 → 1.6x (heavier)
-        // 80:20 → 2.0x (even heavier)
-        // Still trade the other side (base size) for safety
-        // ==========================================================================
-        const upRatio = state.up_px;
-        const downRatio = state.down_px;
-        
-        // Determine which side is "winning" (further from 50%)
-        const isWinningSide = (side === 'UP' && upRatio > 0.5) || (side === 'DOWN' && downRatio > 0.5);
-        
-        if (isWinningSide) {
-            // Calculate how far from 50:50 (0.0 = 50:50, 0.5 = 100:0)
-            const distanceFrom50 = Math.abs((side === 'UP' ? upRatio : downRatio) - 0.5);
-            
-            // Multiplier increases as we move away from 50:50
-            // At 55:45 (distance = 0.05) → 1.1x
-            // At 60:40 (distance = 0.10) → 1.3x
-            // At 70:30 (distance = 0.20) → 1.6x
-            // At 80:20 (distance = 0.30) → 2.0x
-            // Linear interpolation between these points
-            let multiplier = 1.0;
-            if (distanceFrom50 <= 0.05) {
-                // 50:50 to 55:45: 1.0x to 1.1x
-                multiplier = 1.0 + (distanceFrom50 / 0.05) * 0.1;
-            } else if (distanceFrom50 <= 0.10) {
-                // 55:45 to 60:40: 1.1x to 1.3x
-                multiplier = 1.1 + ((distanceFrom50 - 0.05) / 0.05) * 0.2;
-            } else if (distanceFrom50 <= 0.20) {
-                // 60:40 to 70:30: 1.3x to 1.6x
-                multiplier = 1.3 + ((distanceFrom50 - 0.10) / 0.10) * 0.3;
-            } else {
-                // 70:30 to 80:20+: 1.6x to 2.0x (max)
-                multiplier = Math.min(2.0, 1.6 + ((distanceFrom50 - 0.20) / 0.10) * 0.4);
+        // Conditioning on inventory_imbalance_ratio
+        if (conditioningVar === 'inventory_imbalance_ratio') {
+            // Compute inventory imbalance ratio: inv_up / max(inv_down, eps)
+            const eps = 1e-6;
+            const invUp = inventory.inv_up_shares;
+            const invDown = inventory.inv_down_shares;
+            const imbalanceRatio = invUp / Math.max(invDown, eps);
+
+            // Bucket using inventory_bucket_thresholds
+            const thresholds = sizeParams.inventory_bucket_thresholds || [];
+            if (thresholds.length < 2) {
+                // No thresholds, fall back to 1D
+                const sizeTable1d = sizeParams.size_table_1d || {};
+                return sizeTable1d[priceBucketKey] || 1.0;
             }
-            
-            return parseFloat((baseSize * multiplier).toFixed(4));
-        } else {
-            // Losing side: use base size (still trade for safety, but smaller)
-            return baseSize;
+
+            // Find inventory bucket index
+            let invBucketIndex = 0;
+            for (let i = 0; i < thresholds.length - 1; i++) {
+                if (imbalanceRatio <= thresholds[i + 1]) {
+                    invBucketIndex = i;
+                    break;
+                }
+            }
+            if (imbalanceRatio > thresholds[thresholds.length - 1]) {
+                invBucketIndex = thresholds.length - 2; // Last bucket
+            }
+
+            // Construct 2D key: "price_bucket|inventory_bucket"
+            const inventoryBucketLabel = sizeParams.inventory_buckets?.[invBucketIndex] || `bucket_${invBucketIndex}`;
+            const key2d = `${priceBucketKey}|${inventoryBucketLabel}`;
+
+            // Look up in size_table (2D table)
+            const sizeTable = sizeParams.size_table || {};
+            if (sizeTable[key2d] !== undefined) {
+                return sizeTable[key2d];
+            }
+
+            // Fallback 1: Try other inventory buckets for same price bucket
+            const inventoryBuckets = sizeParams.inventory_buckets || [];
+            for (const invBucket of inventoryBuckets) {
+                const fallbackKey = `${priceBucketKey}|${invBucket}`;
+                if (sizeTable[fallbackKey] !== undefined) {
+                    return sizeTable[fallbackKey];
+                }
+            }
+
+            // Fallback 2: Use size_table_1d
+            const sizeTable1d = sizeParams.size_table_1d || {};
+            if (sizeTable1d[priceBucketKey] !== undefined) {
+                return sizeTable1d[priceBucketKey];
+            }
+
+            // Fallback 3: Use median of all sizes
+            const allSizes = Object.values(sizeTable);
+            if (allSizes.length > 0) {
+                const sorted = allSizes.sort((a, b) => a - b);
+                return sorted[Math.floor(sorted.length / 2)];
+            }
+
+            return 1.0;
         }
+
+        // Unknown conditioning_var, fall back to 1D
+        const sizeTable1d = sizeParams.size_table_1d || {};
+        return sizeTable1d[priceBucketKey] || 1.0;
     }
 
     /**
-     * Check inventory and apply rebalance logic
-     * Now uses order book prices to determine winning side (based on PnL)
+     * Check inventory and apply simple rebalance gating.
+     *
+     * This version:
+     * - Enforces max_up_shares / max_down_shares / max_total_shares
+     * - Uses rebalance_ratio_R symmetrically (R, 1-R) to define
+     *   “extreme” imbalance thresholds near 0 and 1.
+     * - Prevents adding more to the currently dominant side once
+     *   the imbalance is beyond those extremes.
+     * - NEVER flips the side; it only blocks trades.
      */
     inventoryOkAndRebalance(
         inventory: InventoryState,
         inventoryParams: InventoryParams | undefined,
         proposedSide: 'UP' | 'DOWN',
-        currentPriceUp?: number,  // Current order book ASK price (execution price for buying UP)
-        currentPriceDown?: number, // Current order book ASK price (execution price for buying DOWN)
-        avgCostUp?: number,        // Average entry price for UP
-        avgCostDown?: number       // Average entry price for DOWN
+        _currentPriceUp?: number,
+        _currentPriceDown?: number,
+        _avgCostUp?: number,
+        _avgCostDown?: number
     ): 'UP' | 'DOWN' | null {
         if (!inventoryParams) {
-            return proposedSide; // No inventory constraints
+            return proposedSide;
         }
 
         const total = inventory.inv_up_shares + inventory.inv_down_shares;
         const eps = 1e-6;
 
-        // Check max total
+        // Hard caps on total and per-side exposure
         if (total >= inventoryParams.max_total_shares) {
-            return null; // At max total
+            return null;
         }
 
-        // Check side-specific limits
         if (proposedSide === 'UP' && inventory.inv_up_shares >= inventoryParams.max_up_shares) {
-            return null; // At max UP
+            return null;
         }
         if (proposedSide === 'DOWN' && inventory.inv_down_shares >= inventoryParams.max_down_shares) {
-            return null; // At max DOWN
+            return null;
         }
 
-        // Rebalance logic: Favor the WINNING side based on order book prices (PnL)
-        // Watch mode shows: when UP is winning (positive PnL), it has MORE UP shares (55.9% UP)
-        // So we should ALLOW accumulation on the winning side, not prevent it
-        const R = inventoryParams.rebalance_ratio_R;
-        
-        // Calculate which side is winning based on order book prices vs entry prices
-        let winningSide: 'UP' | 'DOWN' | null = null;
-        if (currentPriceUp && currentPriceDown && avgCostUp && avgCostDown && 
-            inventory.inv_up_shares > eps && inventory.inv_down_shares > eps) {
-            // Calculate PnL for each side (using order book ASK prices - execution prices)
-            const upPnL = (currentPriceUp - avgCostUp) * inventory.inv_up_shares;
-            const downPnL = (currentPriceDown - avgCostDown) * inventory.inv_down_shares;
-            
-            // Determine winning side (positive PnL)
-            if (upPnL > downPnL && upPnL > 0) {
-                winningSide = 'UP';
-            } else if (downPnL > upPnL && downPnL > 0) {
-                winningSide = 'DOWN';
-            }
-        }
-        
+        // If we have inventory on both sides, gate adding to an already dominant side
         if (inventory.inv_up_shares > eps && inventory.inv_down_shares > eps) {
-            const ratio = inventory.inv_up_shares / (inventory.inv_up_shares + inventory.inv_down_shares);
-            const extremeThreshold = R + 0.1; // Allow up to R, only rebalance if way beyond
-            
-            // If we have price data and know the winning side, favor it
-            if (winningSide && proposedSide === winningSide) {
-                // We want to buy the winning side - allow it even if ratio is high (up to extreme threshold)
-                if (ratio < extremeThreshold) {
-                    return proposedSide; // Allow accumulation on winning side
-                }
-                // If ratio is extreme but we're buying winning side, still allow if under max
-                if (inventory.inv_up_shares < inventoryParams.max_up_shares && 
-                    inventory.inv_down_shares < inventoryParams.max_down_shares) {
-                    return proposedSide;
-                }
+            const ratioUp = inventory.inv_up_shares / total;
+
+            // Inference captures rebalance events when either:
+            //  - ratioUp > ~0.7 and a DOWN trade happens (UP heavy, rebalance via DOWN)
+            //  - ratioUp < ~0.3 and an UP trade happens (DOWN heavy, rebalance via UP)
+            //
+            // That means rebalance_ratio_R can be either above 0.5 or below 0.5.
+            // To avoid over‑constraining markets where R < 0.5 (e.g. ETH_1h),
+            // we treat R and (1-R) symmetrically as “extreme” thresholds.
+            const r = Math.max(0, Math.min(1, inventoryParams.rebalance_ratio_R));
+            const lowExtreme = Math.min(r, 1 - r);       // e.g. 0.30
+            const highExtreme = 1 - lowExtreme;          // e.g. 0.70
+
+            // Only block adding to the dominant side when we're already beyond
+            // the corresponding extreme threshold.
+            if (ratioUp > highExtreme && proposedSide === 'UP') {
+                return null;
             }
-            
-            // If UP ratio is EXTREME (> R + 0.1) and we're trying to buy UP, switch to DOWN
-            if (ratio > extremeThreshold && proposedSide === 'UP') {
-                // Unless UP is winning - then allow it
-                if (winningSide === 'UP' && inventory.inv_up_shares < inventoryParams.max_up_shares) {
-                    return 'UP';
-                }
-                // Check if we can buy DOWN instead
-                if (inventory.inv_down_shares < inventoryParams.max_down_shares && total < inventoryParams.max_total_shares) {
-                    return 'DOWN';
-                }
-                // If we can't buy DOWN, still allow UP if under max
-                if (inventory.inv_up_shares < inventoryParams.max_up_shares) {
-                    return 'UP';
-                }
-                return null; // At max
-            }
-            
-            // If DOWN ratio is EXTREME (UP ratio < 1-R-0.1) and we're trying to buy DOWN, switch to UP
-            if (ratio < (1 - extremeThreshold) && proposedSide === 'DOWN') {
-                // Unless DOWN is winning - then allow it
-                if (winningSide === 'DOWN' && inventory.inv_down_shares < inventoryParams.max_down_shares) {
-                    return 'DOWN';
-                }
-                // Check if we can buy UP instead
-                if (inventory.inv_up_shares < inventoryParams.max_up_shares && total < inventoryParams.max_total_shares) {
-                    return 'UP';
-                }
-                // If we can't buy UP, still allow DOWN if under max
-                if (inventory.inv_down_shares < inventoryParams.max_down_shares) {
-                    return 'DOWN';
-                }
-                return null; // At max
+            if (ratioUp < lowExtreme && proposedSide === 'DOWN') {
+                return null;
             }
         }
 
-        return proposedSide; // No rebalance needed - allow accumulation on either side
+        return proposedSide;
     }
 
     /**
@@ -557,38 +562,75 @@ export class PolicyEngine {
 
         // Both are valid - apply side selection logic
         if (!sideSelectionParams) {
-            // Default: inventory-driven
-            const total = inventory.inv_up_shares + inventory.inv_down_shares;
-            if (total === 0) return 'UP'; // Default to UP if no inventory
-            const upRatio = inventory.inv_up_shares / total;
-            return upRatio < 0.5 ? 'UP' : 'DOWN';
+            // Default: inventory-first tie-break (reduce imbalance toward 1.0)
+            return this.inventoryFirstTieBreak(state, inventory);
         }
 
         const mode = sideSelectionParams.mode;
 
+        // If mode is "mixed" (confidence_gap < 0.10), use inventory-first tie-break
+        if (mode === 'mixed' || (sideSelectionParams.confidence_gap !== undefined && sideSelectionParams.confidence_gap < 0.10)) {
+            return this.inventoryFirstTieBreak(state, inventory);
+        }
+
         if (mode === 'inventory_driven') {
-            const total = inventory.inv_up_shares + inventory.inv_down_shares;
-            if (total === 0) return 'UP';
-            const upRatio = inventory.inv_up_shares / total;
-            return upRatio < 0.5 ? 'UP' : 'DOWN';
+            return this.inventoryFirstTieBreak(state, inventory);
         } else if (mode === 'edge_driven') {
-            // Choose side with better edge (closer to 0.5)
+            // Choose side with better edge (further from 0.5 = higher edge)
             const upDistance = Math.abs(state.up_px - 0.5);
             const downDistance = Math.abs(state.down_px - 0.5);
-            return upDistance < downDistance ? 'UP' : 'DOWN';
+            return upDistance > downDistance ? 'UP' : 'DOWN';
+        } else if (mode === 'momentum_driven') {
+            // Choose side with rising price (positive momentum)
+            const delta5s = features.delta_5s_side_px ?? 0;
+            if (delta5s > 0.001) return 'UP'; // UP price rising
+            if (delta5s < -0.001) return 'DOWN'; // DOWN price rising (UP falling)
+            // Fallback to inventory-first if no clear momentum
+            return this.inventoryFirstTieBreak(state, inventory);
         } else if (mode === 'alternating') {
             // Simple alternating - would need trade history to implement properly
-            // For now, default to inventory-driven
-            const total = inventory.inv_up_shares + inventory.inv_down_shares;
-            if (total === 0) return 'UP';
-            const upRatio = inventory.inv_up_shares / total;
-            return upRatio < 0.5 ? 'UP' : 'DOWN';
+            // For now, default to inventory-first
+            return this.inventoryFirstTieBreak(state, inventory);
         } else if (mode === 'fixed_preference') {
             return sideSelectionParams.preferred_side || 'UP';
         }
 
-        // Fallback
-        return 'UP';
+        // Fallback to inventory-first
+        return this.inventoryFirstTieBreak(state, inventory);
+    }
+
+    /**
+     * Inventory-first tie-break: choose side that reduces imbalance toward 1.0 (50/50)
+     * If balanced, choose side with higher edge (further from 0.5)
+     */
+    private inventoryFirstTieBreak(state: TapeState, inventory: InventoryState): 'UP' | 'DOWN' {
+        const total = inventory.inv_up_shares + inventory.inv_down_shares;
+        const eps = 1e-6;
+
+        if (total < eps) {
+            // No inventory - choose side with higher edge (further from 0.5)
+            const upDistance = Math.abs(state.up_px - 0.5);
+            const downDistance = Math.abs(state.down_px - 0.5);
+            return upDistance > downDistance ? 'UP' : 'DOWN';
+        }
+
+        // Compute imbalance ratio: inv_up / max(inv_down, eps)
+        const imbalanceRatio = inventory.inv_up_shares / Math.max(inventory.inv_down_shares, eps);
+        
+        // Target ratio is 1.0 (balanced: inv_up = inv_down)
+        // Choose side that reduces imbalance toward 1.0
+        if (imbalanceRatio > 1.0) {
+            // UP is higher - choose DOWN to reduce imbalance
+            return 'DOWN';
+        } else if (imbalanceRatio < 1.0) {
+            // DOWN is higher - choose UP to reduce imbalance
+            return 'UP';
+        } else {
+            // Balanced - choose side with higher edge (further from 0.5)
+            const upDistance = Math.abs(state.up_px - 0.5);
+            const downDistance = Math.abs(state.down_px - 0.5);
+            return upDistance > downDistance ? 'UP' : 'DOWN';
+        }
     }
 
     /**
@@ -780,4 +822,3 @@ export class PolicyEngine {
 
 // Singleton instance
 export const policyEngine = new PolicyEngine();
-

@@ -46,6 +46,10 @@ function debugLog(message: string): void {
 // All trading logic comes from params_latest.json - no hardcoded values
 // =============================================================================
 const PAPER_STARTING_CAPITAL = parseFloat(process.env.PAPER_STARTING_CAPITAL || '10000');
+const USER_ADDRESSES = ENV.USER_ADDRESSES;
+const FETCH_INTERVAL = ENV.FETCH_INTERVAL;
+// Simple 50/50 + tilt policy for paper mode
+const SIMPLE_5050_POLICY = process.env.SIMPLE_5050_POLICY !== 'false';
 
 // REMOVED: All hardcoded share distributions, timing patterns, biases, etc.
 // These are now handled by parameters:
@@ -55,11 +59,10 @@ const PAPER_STARTING_CAPITAL = parseFloat(process.env.PAPER_STARTING_CAPITAL || 
 // - entry_params: Entry conditions
 
 // Only keep essential constants for system operation
-const POLL_INTERVAL_MS = 1; // Poll interval - maximum speed
+// Use FETCH_INTERVAL as a baseline so paper mode doesn't run orders of magnitude
+// faster than watch mode. Clamp to a reasonable lower bound for responsiveness.
+const POLL_INTERVAL_MS = Math.max(100, FETCH_INTERVAL * 1000); // Main loop cadence
 const EXPIRATION_WINDOW_MS = 2 * 60 * 1000; // Stop trading 2 min before expiration (safety)
-
-const USER_ADDRESSES = ENV.USER_ADDRESSES;
-const FETCH_INTERVAL = ENV.FETCH_INTERVAL;
 
 if (!USER_ADDRESSES || USER_ADDRESSES.length === 0) {
     throw new Error('USER_ADDRESSES is not defined or empty');
@@ -1528,7 +1531,11 @@ async function buildPositionIncrementally(market: typeof discoveredMarkets exten
     // ==========================================================================
     // POLICY-BASED TRADING: Use inferred parameters from params_latest.json
     // This replaces hardcoded logic with data-driven decisions
-    // IMPORTANT: Check both UP and DOWN sides separately (watcher trades both!)
+    // IMPORTANT: By default we run a simplified 50/50 + tilt policy for PAPER:
+    // - Start roughly 50/50 UP/DOWN
+    // - Tilt toward the currently higher-priced (winning) side
+    // - Use watcher-sized trades (size_table / size_table_1d)
+    // - Respect inventory_params and risk_params caps
     // ==========================================================================
     const paramMarketKey = getParamMarketKey(market.marketKey);
     const marketParams = paramLoader.getMarketParams(market.marketKey);
@@ -1540,107 +1547,274 @@ async function buildPositionIncrementally(market: typeof discoveredMarkets exten
     let tradeDown = 0;
 
     // DEBUG: Log what parameters we got
-    debugLog(`[Param Load] ${market.marketKey} -> ${paramMarketKey} (1h=${market.marketKey.includes('-1h')}): entry=${!!marketParams.entry_params}, size=${!!marketParams.size_params}, inv=${!!marketParams.inventory_params}, cadence=${!!marketParams.cadence_params}`);
-    
+    debugLog(`[Param Load] ${market.marketKey} -> ${paramMarketKey} (1h=${market.marketKey.includes('-1h')}): entry=${!!marketParams.entry_params}, size=${!!marketParams.size_params}, inv=${!!marketParams.inventory_params}, cadence=${!!marketParams.cadence_params}, risk=${!!marketParams.risk_params}`);
+
+    // If required params are missing, skip trading for this market
+    // NOTE: risk_params are optional – if missing we just won't apply extra risk gating.
+    if (!marketParams.size_params || !marketParams.inventory_params || !marketParams.cadence_params) {
+        debugLog(`[Policy] ${market.marketKey}: Missing core params for paper policy (size=${!!marketParams.size_params}, inv=${!!marketParams.inventory_params}, cadence=${!!marketParams.cadence_params})`);
+        return;
+    }
+
     // Special debug for 1h markets
     if (market.marketKey.includes('-1h')) {
         debugLog(`[1h Market] ${market.marketKey}: Checking if should trade...`);
     }
-    
-    // Check if we have policy parameters
-    if (marketParams.entry_params && marketParams.size_params) {
-            // Update price history first (policy integrator needs this for features)
-            policyIntegrator.updatePriceHistory(paramMarketKey, now, market.priceUp || 0.5, market.priceDown || 0.5);
-            
-            // Create tape state for policy engine
-            const tapeState: TapeState = {
-                timestamp: now,
-                up_px: market.priceUp || 0.5,
-                down_px: market.priceDown || 0.5,
-                market: paramMarketKey
-            };
-            
-            // Get price history from policy integrator (for feature computation)
-            const priceHistory = policyIntegrator.getPriceHistory(paramMarketKey);
-            
-            // Compute features (deltas, volatility, etc. from price history)
-            const features = policyEngine.computeFeatures(tapeState, priceHistory);
-            
-            // DEBUG: Log parameter check
-            debugLog(`[Policy Check] ${market.marketKey} (${paramMarketKey}): UP=${market.priceUp?.toFixed(3)}, DOWN=${market.priceDown?.toFixed(3)} | entry_params=${!!marketParams.entry_params}, size_params=${!!marketParams.size_params}, cadence_params=${!!marketParams.cadence_params}`);
-            
-            // Check cadence first
-            const cadenceInfo = policyIntegrator.getCadenceInfo(paramMarketKey);
-            const cadenceOk = policyEngine.cadenceOk(cadenceInfo.lastTradeTime, cadenceInfo.recentTradeTimes, marketParams.cadence_params, now);
-            
-            if (!cadenceOk) {
-                debugLog(`[Policy] ${market.marketKey}: Cadence blocked (lastTrade=${cadenceInfo.lastTradeTime}, recent=${cadenceInfo.recentTradeTimes.length})`);
-                return;
+
+    // --------------------------------------------------------------------------
+    // SIMPLE 50/50 + TILT POLICY (default for paper mode)
+    // --------------------------------------------------------------------------
+    if (SIMPLE_5050_POLICY) {
+        // Update price history for feature computation (size tables were inferred
+        // using these same features)
+        policyIntegrator.updatePriceHistory(paramMarketKey, now, market.priceUp || 0.5, market.priceDown || 0.5);
+
+        const tapeState: TapeState = {
+            timestamp: now,
+            up_px: market.priceUp || 0.5,
+            down_px: market.priceDown || 0.5,
+            market: paramMarketKey
+        };
+
+        const priceHistory = policyIntegrator.getPriceHistory(paramMarketKey);
+        const features = policyEngine.computeFeatures(tapeState, priceHistory);
+
+        const priceSum = tapeState.up_px + tapeState.down_px;
+        const maxDeviation = marketParams.quality_filter_params?.max_price_sum_deviation ?? 0.1;
+        if (Math.abs(priceSum - 1.0) > maxDeviation) {
+            debugLog(`[SimplePolicy] ${market.marketKey}: Skipped (price sum deviation ${Math.abs(priceSum - 1.0).toFixed(4)} > ${maxDeviation})`);
+            return;
+        }
+
+        // Cadence gating (min gaps / max trades per sec/min)
+        const cadenceInfo = policyIntegrator.getCadenceInfo(paramMarketKey);
+        const cadenceOk = policyEngine.cadenceOk(
+            cadenceInfo.lastTradeTime,
+            cadenceInfo.recentTradeTimes,
+            marketParams.cadence_params,
+            now
+        );
+        if (!cadenceOk) {
+            debugLog(`[SimplePolicy] ${market.marketKey}: Cadence blocked (lastTrade=${cadenceInfo.lastTradeTime}, recent=${cadenceInfo.recentTradeTimes.length})`);
+            return;
+        }
+
+        const inventoryState = policyIntegrator.getInventoryState(paramMarketKey);
+        const tradesThisSessionApprox = cadenceInfo.recentTradeTimes.length;
+
+        if (!policyEngine.checkRiskLimits(tradesThisSessionApprox, inventoryState, marketParams.risk_params)) {
+            debugLog(`[SimplePolicy] ${market.marketKey}: Risk limits blocked (inv_up=${inventoryState.inv_up_shares}, inv_down=${inventoryState.inv_down_shares})`);
+            return;
+        }
+
+        const totalShares = inventoryState.inv_up_shares + inventoryState.inv_down_shares;
+        const currentUpFrac = totalShares > 0 ? inventoryState.inv_up_shares / totalShares : 0.5;
+
+        // Winning side = higher-priced side; normalize so UP+DOWN≈1 before tilt
+        const normalizedUp = priceSum > 0 ? tapeState.up_px / priceSum : 0.5;
+        const diffFromHalf = normalizedUp - 0.5; // positive -> UP winning, negative -> DOWN winning
+        const maxTilt = 0.2; // max +/-20% away from 50/50
+        const tilt = Math.max(-maxTilt, Math.min(maxTilt, diffFromHalf * 2)); // scale diff into [-maxTilt, maxTilt]
+        const targetUpFrac = 0.5 + tilt;
+        const targetDownFrac = 1 - targetUpFrac;
+
+        debugLog(
+            `[SimplePolicy] ${market.marketKey}: currentUpFrac=${currentUpFrac.toFixed(3)}, targetUpFrac=${targetUpFrac.toFixed(3)}, priceUp=${tapeState.up_px.toFixed(
+                3
+            )}, priceDown=${tapeState.down_px.toFixed(3)}, tilt=${tilt.toFixed(3)}`
+        );
+
+        let proposedUpShares = 0;
+        let proposedDownShares = 0;
+
+        if (totalShares === 0) {
+            // First trades for this market: buy both sides once to start near 50/50.
+            const rawUp = policyEngine.sizeForTrade(tapeState, features, marketParams.size_params, 'UP', inventoryState);
+            const rawDown = policyEngine.sizeForTrade(tapeState, features, marketParams.size_params, 'DOWN', inventoryState);
+            proposedUpShares = rawUp * sizeScale;
+            proposedDownShares = rawDown * sizeScale;
+            debugLog(
+                `[SimplePolicy] ${market.marketKey}: First position -> UP=${proposedUpShares.toFixed(
+                    4
+                )} shares, DOWN=${proposedDownShares.toFixed(4)} shares`
+            );
+        } else {
+            // Choose side that moves us toward targetUpFrac
+            let sideToTrade: 'UP' | 'DOWN';
+            if (currentUpFrac < targetUpFrac) {
+                sideToTrade = 'UP';
+            } else if (currentUpFrac > targetUpFrac) {
+                sideToTrade = 'DOWN';
+            } else {
+                sideToTrade = diffFromHalf >= 0 ? 'UP' : 'DOWN';
             }
-        
-        // Get order book prices for rebalancing (to determine winning side based on PnL)
-        // Fetch actual ASK prices (execution prices) - these are what we'd pay to buy
+
+            const rawShares = policyEngine.sizeForTrade(tapeState, features, marketParams.size_params, sideToTrade, inventoryState);
+            const scaledShares = rawShares * sizeScale;
+
+            if (sideToTrade === 'UP') {
+                proposedUpShares = scaledShares;
+            } else {
+                proposedDownShares = scaledShares;
+            }
+
+            debugLog(
+                `[SimplePolicy] ${market.marketKey}: Side=${sideToTrade}, proposedShares=${scaledShares.toFixed(
+                    4
+                )}, targetUpFrac=${targetUpFrac.toFixed(3)}`
+            );
+        }
+
+        // Inventory caps: do not exceed per-side / total limits
+        const invParams = marketParams.inventory_params;
+
+        if (proposedUpShares > 0) {
+            const newUpShares = inventoryState.inv_up_shares + proposedUpShares;
+            const newTotal = newUpShares + inventoryState.inv_down_shares;
+            if (
+                newUpShares > invParams.max_up_shares ||
+                newTotal > invParams.max_total_shares ||
+                policyEngine.inventoryOkAndRebalance(inventoryState, invParams, 'UP') !== 'UP'
+            ) {
+                debugLog(
+                    `[SimplePolicy] ${market.marketKey}: UP trade blocked by inventory limits (newUp=${newUpShares}, maxUp=${invParams.max_up_shares}, newTotal=${newTotal}, maxTotal=${invParams.max_total_shares})`
+                );
+                proposedUpShares = 0;
+            }
+        }
+
+        if (proposedDownShares > 0) {
+            const newDownShares = inventoryState.inv_down_shares + proposedDownShares;
+            const newTotal = newDownShares + inventoryState.inv_up_shares;
+            if (
+                newDownShares > invParams.max_down_shares ||
+                newTotal > invParams.max_total_shares ||
+                policyEngine.inventoryOkAndRebalance(inventoryState, invParams, 'DOWN') !== 'DOWN'
+            ) {
+                debugLog(
+                    `[SimplePolicy] ${market.marketKey}: DOWN trade blocked by inventory limits (newDown=${newDownShares}, maxDown=${invParams.max_down_shares}, newTotal=${newTotal}, maxTotal=${invParams.max_total_shares})`
+                );
+                proposedDownShares = 0;
+            }
+        }
+
+        if (proposedUpShares === 0 && proposedDownShares === 0) {
+            debugLog(`[SimplePolicy] ${market.marketKey}: No trade after inventory/risk checks`);
+            return;
+        }
+
+        // Convert shares to notional using snapshot prices; final execution will use live order book asks.
+        if (proposedUpShares > 0) {
+            sharesUp = proposedUpShares;
+            tradeUp = sharesUp * tapeState.up_px;
+        }
+        if (proposedDownShares > 0) {
+            sharesDown = proposedDownShares;
+            tradeDown = sharesDown * tapeState.down_px;
+        }
+    } else if (marketParams.entry_params && marketParams.size_params) {
+        // ----------------------------------------------------------------------
+        // Original param-driven policy (kept behind flag for compatibility)
+        // ----------------------------------------------------------------------
+        policyIntegrator.updatePriceHistory(paramMarketKey, now, market.priceUp || 0.5, market.priceDown || 0.5);
+
+        const tapeState: TapeState = {
+            timestamp: now,
+            up_px: market.priceUp || 0.5,
+            down_px: market.priceDown || 0.5,
+            market: paramMarketKey
+        };
+
+        const priceHistory = policyIntegrator.getPriceHistory(paramMarketKey);
+        const features = policyEngine.computeFeatures(tapeState, priceHistory);
+
+        debugLog(
+            `[Policy Check] ${market.marketKey} (${paramMarketKey}): UP=${market.priceUp?.toFixed(
+                3
+            )}, DOWN=${market.priceDown?.toFixed(3)} | entry_params=${!!marketParams.entry_params}, size_params=${!!marketParams.size_params}, cadence_params=${!!marketParams.cadence_params}`
+        );
+
+        const cadenceInfo = policyIntegrator.getCadenceInfo(paramMarketKey);
+        const cadenceOk = policyEngine.cadenceOk(
+            cadenceInfo.lastTradeTime,
+            cadenceInfo.recentTradeTimes,
+            marketParams.cadence_params,
+            now
+        );
+
+        if (!cadenceOk) {
+            debugLog(`[Policy] ${market.marketKey}: Cadence blocked (lastTrade=${cadenceInfo.lastTradeTime}, recent=${cadenceInfo.recentTradeTimes.length})`);
+            return;
+        }
+
         const orderBookPrices = await getOrderBookExecutionPrices(market.assetUp, market.assetDown);
         const execPriceUp = orderBookPrices.execPriceUp || market.priceUp || 0.5;
         const execPriceDown = orderBookPrices.execPriceDown || market.priceDown || 0.5;
-        
-        // Get average entry prices from build state or inventory
-        const buildState = buildingPositions.get(positionKey);
+
+        const buildStateForAvg = buildingPositions.get(positionKey);
         const inventoryState = policyIntegrator.getInventoryState(paramMarketKey);
-        const avgCostUp = buildState?.avgPriceUp || inventoryState.avg_cost_up || 0;
-        const avgCostDown = buildState?.avgPriceDown || inventoryState.avg_cost_down || 0;
-        
-        // Check UP side independently (using checkSideEntry to avoid UP-first bias)
-        // REMOVED: !upComplete check - let policy's inventory limits handle position sizing
+        const avgCostUp = buildStateForAvg?.avgPriceUp || inventoryState.avg_cost_up || 0;
+        const avgCostDown = buildStateForAvg?.avgPriceDown || inventoryState.avg_cost_down || 0;
+
         const upEntrySignal = policyEngine.checkSideEntry(tapeState, features, marketParams.entry_params, 'UP');
-        debugLog(`[Policy UP Check] ${market.marketKey}: should_trade=${upEntrySignal.should_trade}, reason="${upEntrySignal.reason}", price=${market.priceUp?.toFixed(3)} (min=${marketParams.entry_params.up_price_min}, max=${marketParams.entry_params.up_price_max})`);
-        
+        debugLog(
+            `[Policy UP Check] ${market.marketKey}: should_trade=${upEntrySignal.should_trade}, reason="${upEntrySignal.reason}", price=${market.priceUp?.toFixed(
+                3
+            )} (min=${marketParams.entry_params.up_price_min}, max=${marketParams.entry_params.up_price_max})`
+        );
+
         if (upEntrySignal.should_trade && upEntrySignal.side === 'UP') {
             const rawUpShares = policyEngine.sizeForTrade(tapeState, features, marketParams.size_params, 'UP', inventoryState);
             const upShares = rawUpShares * sizeScale;
-            // Pass order book prices and avg costs to determine winning side
             const upFinalSide = policyEngine.inventoryOkAndRebalance(
-                inventoryState, 
-                marketParams.inventory_params, 
+                inventoryState,
+                marketParams.inventory_params,
                 'UP',
-                execPriceUp,  // Current order book ASK price (execution price)
+                execPriceUp,
                 execPriceDown,
-                avgCostUp,   // Average entry price
+                avgCostUp,
                 avgCostDown
             );
-            
-            debugLog(`[Policy UP] ${market.marketKey}: shares=${upShares.toFixed(4)}, finalSide=${upFinalSide}, inventory=(${inventoryState.inv_up_shares} UP, ${inventoryState.inv_down_shares} DOWN), execPrice=${execPriceUp.toFixed(4)}, avgCost=${avgCostUp.toFixed(4)}`);
-            
+
+            debugLog(
+                `[Policy UP] ${market.marketKey}: shares=${upShares.toFixed(4)}, finalSide=${upFinalSide}, inventory=(${inventoryState.inv_up_shares} UP, ${inventoryState.inv_down_shares} DOWN), execPrice=${execPriceUp.toFixed(
+                    4
+                )}, avgCost=${avgCostUp.toFixed(4)}`
+            );
+
             if (upFinalSide === 'UP' && upShares > 0) {
                 sharesUp = upShares;
-                tradeUp = sharesUp * execPriceUp; // Use execution price for trade value
+                tradeUp = sharesUp * execPriceUp;
                 debugLog(`[Policy UP] ${market.marketKey}: ✅ TRADING ${upShares.toFixed(4)} shares (${upEntrySignal.reason})`);
             } else {
                 debugLog(`[Policy UP] ${market.marketKey}: ❌ Blocked (finalSide=${upFinalSide}, shares=${upShares})`);
             }
         }
-        
-        // Check DOWN side independently (CRITICAL: Check both sides separately!)
-        // REMOVED: !downComplete check - let policy's inventory limits handle position sizing
+
         const downEntrySignal = policyEngine.checkSideEntry(tapeState, features, marketParams.entry_params, 'DOWN');
-        debugLog(`[Policy DOWN Check] ${market.marketKey}: should_trade=${downEntrySignal.should_trade}, reason="${downEntrySignal.reason}", price=${market.priceDown?.toFixed(3)} (min=${marketParams.entry_params.down_price_min}, max=${marketParams.entry_params.down_price_max})`);
-        
+        debugLog(
+            `[Policy DOWN Check] ${market.marketKey}: should_trade=${downEntrySignal.should_trade}, reason="${downEntrySignal.reason}", price=${market.priceDown?.toFixed(
+                3
+            )} (min=${marketParams.entry_params.down_price_min}, max=${marketParams.entry_params.down_price_max})`
+        );
+
         if (downEntrySignal.should_trade && downEntrySignal.side === 'DOWN') {
             const rawDownShares = policyEngine.sizeForTrade(tapeState, features, marketParams.size_params, 'DOWN', inventoryState);
             const downShares = rawDownShares * sizeScale;
-            // Pass order book prices and avg costs to determine winning side
             const downFinalSide = policyEngine.inventoryOkAndRebalance(
-                inventoryState, 
-                marketParams.inventory_params, 
+                inventoryState,
+                marketParams.inventory_params,
                 'DOWN',
-                execPriceUp,  // Current order book ASK price (execution price)
+                execPriceUp,
                 execPriceDown,
-                avgCostUp,   // Average entry price
+                avgCostUp,
                 avgCostDown
             );
-            
-            debugLog(`[Policy DOWN] ${market.marketKey}: shares=${downShares.toFixed(4)}, finalSide=${downFinalSide}, inventory=(${inventoryState.inv_up_shares} UP, ${inventoryState.inv_down_shares} DOWN)`);
-            
+
+            debugLog(
+                `[Policy DOWN] ${market.marketKey}: shares=${downShares.toFixed(4)}, finalSide=${downFinalSide}, inventory=(${inventoryState.inv_up_shares} UP, ${inventoryState.inv_down_shares} DOWN)`
+            );
+
             if (downFinalSide === 'DOWN' && downShares > 0) {
                 sharesDown = downShares;
                 tradeDown = sharesDown * market.priceDown;
@@ -1649,19 +1823,16 @@ async function buildPositionIncrementally(market: typeof discoveredMarkets exten
                 debugLog(`[Policy DOWN] ${market.marketKey}: ❌ Blocked (finalSide=${downFinalSide}, shares=${downShares})`);
             }
         }
-        
-        // If neither side should trade according to policy, return
+
         if (sharesUp === 0 && sharesDown === 0) {
             debugLog(`[Policy] ${market.marketKey}: ❌ No trade (entry rules not met or inventory blocked)`);
             return;
         }
     } else {
-        // NO PARAMS = NO TRADING
-        // Parameters are required - no fallback hardcoded logic
-        debugLog(`[NO PARAMS] ${market.marketKey} (${paramMarketKey}): Missing required parameters! entry_params=${!!marketParams.entry_params}, size_params=${!!marketParams.size_params}`);
-        debugLog(`[NO PARAMS] Available markets in params: ${Object.keys(paramLoader.getParams()).filter(k => !['entry_params', 'size_params', 'inventory_params', 'cadence_params'].includes(k)).join(', ')}`);
-        debugLog(`[NO PARAMS] Cannot trade without parameters - skipping ${market.marketKey}`);
-        return; // Don't trade if no parameters
+        debugLog(
+            `[Policy] ${market.marketKey}: entry/size params missing for legacy policy (entry=${!!marketParams.entry_params}, size=${!!marketParams.size_params})`
+        );
+        return;
     }
 
     // REMOVED: Capping trades to remaining targets
@@ -2652,7 +2823,9 @@ const paperTradeMonitor = async () => {
     await cleanupExpiredMarketsAndPositions();
 
     // Start a separate fast price update loop (runs in parallel with main loop)
-    const FAST_PRICE_UPDATE_MS = 1; // Update prices every 50ms - maximum speed
+    // Use a modest update interval; prices change quickly but we don't need
+    // sub-millisecond polling to mirror watcher behavior.
+    const FAST_PRICE_UPDATE_MS = 100; // Update prices every 100ms
     let priceUpdateRunning = true;
     const fastPriceUpdateLoop = async () => {
         while (priceUpdateRunning && isRunning) {

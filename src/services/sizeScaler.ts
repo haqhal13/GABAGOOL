@@ -60,6 +60,13 @@ class SizeScaler {
     }
 
     getScale(marketKey: string): number {
+        // By default, disable dynamic scaling so that paper mode
+        // uses the raw inferred size tables. To re-enable, set
+        // USE_SIZE_SCALER=true in the environment.
+        if (process.env.USE_SIZE_SCALER !== 'true') {
+            return 1;
+        }
+
         this.init();
         const scale = this.scales.get(marketKey);
         if (scale !== undefined && isFinite(scale) && scale > 0) {
@@ -70,4 +77,3 @@ class SizeScaler {
 }
 
 export const sizeScaler = new SizeScaler();
-

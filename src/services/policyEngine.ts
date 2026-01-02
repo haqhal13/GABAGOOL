@@ -57,6 +57,11 @@ export interface EntrySignal {
     reason: string;
 }
 
+// For paper mode we want to trade across the full price range rather than
+// using tight inferred bands. This flag effectively disables band checks
+// in the entry logic so that behavior is driven by sizing + inventory.
+const IGNORE_ENTRY_BANDS = true;
+
 export class PolicyEngine {
     /**
      * Compute features from tape state and history
@@ -140,12 +145,14 @@ export class PolicyEngine {
         }
 
         // Check UP price band
-        const upInBand = entryParams.up_price_min !== null && entryParams.up_price_max !== null &&
-            state.up_px >= entryParams.up_price_min && state.up_px <= entryParams.up_price_max;
+        const upInBand = IGNORE_ENTRY_BANDS ||
+            (entryParams.up_price_min !== null && entryParams.up_price_max !== null &&
+                state.up_px >= entryParams.up_price_min && state.up_px <= entryParams.up_price_max);
 
         // Check DOWN price band
-        const downInBand = entryParams.down_price_min !== null && entryParams.down_price_max !== null &&
-            state.down_px >= entryParams.down_price_min && state.down_px <= entryParams.down_price_max;
+        const downInBand = IGNORE_ENTRY_BANDS ||
+            (entryParams.down_price_min !== null && entryParams.down_price_max !== null &&
+                state.down_px >= entryParams.down_price_min && state.down_px <= entryParams.down_price_max);
 
         // Check momentum/reversion mode
         const delta5s = features.delta_5s_side_px ?? 0;
@@ -473,31 +480,6 @@ export class PolicyEngine {
             return null;
         }
 
-        // If we have inventory on both sides, gate adding to an already dominant side
-        if (inventory.inv_up_shares > eps && inventory.inv_down_shares > eps) {
-            const ratioUp = inventory.inv_up_shares / total;
-
-            // Inference captures rebalance events when either:
-            //  - ratioUp > ~0.7 and a DOWN trade happens (UP heavy, rebalance via DOWN)
-            //  - ratioUp < ~0.3 and an UP trade happens (DOWN heavy, rebalance via UP)
-            //
-            // That means rebalance_ratio_R can be either above 0.5 or below 0.5.
-            // To avoid over‑constraining markets where R < 0.5 (e.g. ETH_1h),
-            // we treat R and (1-R) symmetrically as “extreme” thresholds.
-            const r = Math.max(0, Math.min(1, inventoryParams.rebalance_ratio_R));
-            const lowExtreme = Math.min(r, 1 - r);       // e.g. 0.30
-            const highExtreme = 1 - lowExtreme;          // e.g. 0.70
-
-            // Only block adding to the dominant side when we're already beyond
-            // the corresponding extreme threshold.
-            if (ratioUp > highExtreme && proposedSide === 'UP') {
-                return null;
-            }
-            if (ratioUp < lowExtreme && proposedSide === 'DOWN') {
-                return null;
-            }
-        }
-
         return proposedSide;
     }
 
@@ -514,8 +496,8 @@ export class PolicyEngine {
             return true; // No cadence constraints
         }
 
-        // Check minimum inter-trade time
-        if (lastTradeTs !== null) {
+        // Check minimum inter-trade time (directly from inferred params)
+        if (lastTradeTs !== null && cadenceParams.min_inter_trade_ms > 0) {
             const timeSinceLast = currentTs - lastTradeTs;
             if (timeSinceLast < cadenceParams.min_inter_trade_ms) {
                 return false;

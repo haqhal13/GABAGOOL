@@ -64,7 +64,9 @@ class MarketTracker {
     private displayInterval = 500;
     private lastMarketCount = 0;
     private loggedMarkets: Set<string> = new Set(); // Track markets already logged to CSV
+    private pnlCapturedMarkets: Set<string> = new Set(); // Track markets that have had PnL captured 5s before close
     private csvFilePath: string;
+    private simplePnlCsvPath: string; // Simple CSV for watcher PnL records
     private maxMarkets = 4; // Maximum number of markets to track at once
     private marketsToClose: MarketStats[] = []; // Markets that need to be closed
     private onMarketCloseCallback?: (market: MarketStats) => Promise<void>; // Callback for closing positions
@@ -92,6 +94,152 @@ class MarketTracker {
         const runId = getRunId();
         this.csvFilePath = path.join(targetDir, `${fileName}_${runId}.csv`);
         this.initializeCsvFile();
+        
+        // Initialize simple PnL CSV for watcher mode only
+        if (!isPaperMode) {
+            this.simplePnlCsvPath = path.join(logsDir, 'watcher_pnl_records.csv');
+            this.initializeSimplePnlCsv();
+        } else {
+            this.simplePnlCsvPath = '';
+        }
+    }
+
+    /**
+     * Initialize simple PnL CSV file with headers (for watcher mode only)
+     */
+    private initializeSimplePnlCsv(): void {
+        try {
+            if (!fs.existsSync(this.simplePnlCsvPath)) {
+                const header = 'Market Name,Completion Time,PnL\n';
+                fs.writeFileSync(this.simplePnlCsvPath, header, 'utf8');
+            }
+        } catch (error) {
+            console.error(`Failed to initialize simple PnL CSV: ${error}`);
+        }
+    }
+
+    /**
+     * Log market completion PnL to simple CSV file (watcher mode only)
+     */
+    private logSimplePnlToCsv(marketName: string, pnl: number, captureTime?: Date): void {
+        if (!this.simplePnlCsvPath) return; // Skip if not in watcher mode
+        
+        try {
+            // Ensure CSV file exists with headers
+            if (!fs.existsSync(this.simplePnlCsvPath)) {
+                this.initializeSimplePnlCsv();
+            }
+
+            // Format: Market Name, Completion Time, PnL
+            const completionTime = captureTime ? captureTime.toISOString() : new Date().toISOString();
+            const csvLine = `"${marketName.replace(/"/g, '""')}",${completionTime},${pnl.toFixed(2)}\n`;
+            fs.appendFileSync(this.simplePnlCsvPath, csvLine, 'utf8');
+        } catch (error) {
+            console.error(`Failed to write simple PnL to CSV: ${error}`);
+        }
+    }
+
+    /**
+     * Calculate current PnL for a market based on current prices
+     */
+    private calculateCurrentPnL(market: MarketStats): number {
+        const totalCostBasis = market.totalCostUp + market.totalCostDown;
+        const priceUp = market.currentPriceUp ?? 0;
+        const priceDown = market.currentPriceDown ?? 0;
+
+        let finalValueUp = 0;
+        let finalValueDown = 0;
+
+        if (market.sharesUp > 0 && priceUp > 0) {
+            finalValueUp = market.sharesUp * priceUp;
+        }
+
+        if (market.sharesDown > 0 && priceDown > 0) {
+            finalValueDown = market.sharesDown * priceDown;
+        }
+
+        const totalFinalValue = finalValueUp + finalValueDown;
+        return totalFinalValue - totalCostBasis;
+    }
+
+    /**
+     * Calculate current PnL with live price fetching (async version)
+     * Use this when rotating markets to ensure we have latest prices
+     */
+    private async calculateCurrentPnLWithLivePrices(market: MarketStats): Promise<number> {
+        const totalCostBasis = market.totalCostUp + market.totalCostDown;
+
+        // Start with cached prices
+        let priceUp = market.currentPriceUp ?? 0;
+        let priceDown = market.currentPriceDown ?? 0;
+
+        // If prices are 0 or missing, try to fetch live prices from order book
+        if ((priceUp === 0 || priceDown === 0) && (market.assetUp || market.assetDown)) {
+            try {
+                // Fetch from CLOB order book for accurate prices
+                if (market.assetUp && priceUp === 0) {
+                    const bookUp = await fetchData(`https://clob.polymarket.com/book?token_id=${market.assetUp}`).catch(() => null);
+                    if (bookUp?.bids?.length > 0 && bookUp?.asks?.length > 0) {
+                        const bestBid = Math.max(...bookUp.bids.map((b: any) => parseFloat(b.price || 0)));
+                        const bestAsk = Math.min(...bookUp.asks.map((a: any) => parseFloat(a.price || 1)));
+                        if (bestBid > 0 && bestAsk > 0) {
+                            priceUp = (bestBid + bestAsk) / 2;
+                        }
+                    }
+                }
+                if (market.assetDown && priceDown === 0) {
+                    const bookDown = await fetchData(`https://clob.polymarket.com/book?token_id=${market.assetDown}`).catch(() => null);
+                    if (bookDown?.bids?.length > 0 && bookDown?.asks?.length > 0) {
+                        const bestBid = Math.max(...bookDown.bids.map((b: any) => parseFloat(b.price || 0)));
+                        const bestAsk = Math.min(...bookDown.asks.map((a: any) => parseFloat(a.price || 1)));
+                        if (bestBid > 0 && bestAsk > 0) {
+                            priceDown = (bestBid + bestAsk) / 2;
+                        }
+                    }
+                }
+            } catch (e) {
+                // Fall back to cached prices
+            }
+        }
+
+        let finalValueUp = 0;
+        let finalValueDown = 0;
+
+        if (market.sharesUp > 0 && priceUp > 0) {
+            finalValueUp = market.sharesUp * priceUp;
+        }
+
+        if (market.sharesDown > 0 && priceDown > 0) {
+            finalValueDown = market.sharesDown * priceDown;
+        }
+
+        const totalFinalValue = finalValueUp + finalValueDown;
+        return totalFinalValue - totalCostBasis;
+    }
+
+    /**
+     * Check and capture PnL 5 seconds before market closes
+     */
+    private checkAndCapturePnLBeforeClose(market: MarketStats): void {
+        if (!market.endDate || !this.simplePnlCsvPath) return; // Skip if no endDate or not in watcher mode
+        
+        const now = Date.now();
+        const endDateMs = market.endDate < 10000000000 ? market.endDate * 1000 : market.endDate;
+        const timeToClose = endDateMs - now;
+        const FIVE_SECONDS_MS = 5 * 1000;
+        
+        // Check if we're 5 seconds before close and haven't captured yet
+        if (timeToClose > 0 && timeToClose <= FIVE_SECONDS_MS && !this.pnlCapturedMarkets.has(market.marketKey)) {
+            // Calculate current PnL
+            const currentPnL = this.calculateCurrentPnL(market);
+            
+            // Log to CSV with full market name
+            const fullMarketName = market.marketName || market.marketKey;
+            const captureTime = new Date(now);
+            this.logSimplePnlToCsv(fullMarketName, currentPnL, captureTime);
+            this.pnlCapturedMarkets.add(market.marketKey);
+            console.log(`📊 Captured PnL 5s before close: ${fullMarketName} | PnL: $${currentPnL.toFixed(2)}`);
+        }
     }
 
     /**
@@ -298,6 +446,12 @@ class MarketTracker {
         try {
             fs.appendFileSync(this.csvFilePath, row + '\n', 'utf8');
             this.loggedMarkets.add(market.marketKey);
+            
+            // Also log to simple CSV for watcher mode (only if not already captured 5s before close)
+            if (!this.pnlCapturedMarkets.has(market.marketKey)) {
+                const fullMarketName = market.marketName || market.marketKey;
+                this.logSimplePnlToCsv(fullMarketName, totalPnl);
+            }
         } catch (error) {
             console.error(`Failed to write PnL to CSV: ${error}`);
         }
@@ -800,8 +954,27 @@ class MarketTracker {
             }
         }
 
-        // Remove older markets
+        // Remove older markets - BUT FIRST capture PnL before deleting!
         for (const key of marketsToRemove) {
+            const marketToRemove = this.markets.get(key);
+            if (marketToRemove) {
+                // Capture PnL before removing (if not already captured)
+                if (!this.pnlCapturedMarkets.has(key)) {
+                    // Use async version to fetch live prices if needed
+                    this.calculateCurrentPnLWithLivePrices(marketToRemove).then(currentPnL => {
+                        const fullMarketName = marketToRemove.marketName || marketToRemove.marketKey;
+                        this.logSimplePnlToCsv(fullMarketName, currentPnL, new Date());
+                        console.log(`📊 Captured PnL before rotation: ${fullMarketName} | PnL: $${currentPnL.toFixed(2)}`);
+                    }).catch(() => {
+                        // Fallback to sync version
+                        const currentPnL = this.calculateCurrentPnL(marketToRemove);
+                        const fullMarketName = marketToRemove.marketName || marketToRemove.marketKey;
+                        this.logSimplePnlToCsv(fullMarketName, currentPnL, new Date());
+                        console.log(`📊 Captured PnL before rotation (fallback): ${fullMarketName} | PnL: $${currentPnL.toFixed(2)}`);
+                    });
+                    this.pnlCapturedMarkets.add(key);
+                }
+            }
             this.markets.delete(key);
         }
     }
@@ -868,8 +1041,27 @@ class MarketTracker {
             }
         }
 
-        // Remove the previous time window markets
+        // Remove the previous time window markets - BUT FIRST capture PnL before deleting!
         for (const key of marketsToRemove) {
+            const marketToRemove = this.markets.get(key);
+            if (marketToRemove) {
+                // Capture PnL before removing (if not already captured)
+                if (!this.pnlCapturedMarkets.has(key)) {
+                    // Use async version to fetch live prices if needed
+                    this.calculateCurrentPnLWithLivePrices(marketToRemove).then(currentPnL => {
+                        const fullMarketName = marketToRemove.marketName || marketToRemove.marketKey;
+                        this.logSimplePnlToCsv(fullMarketName, currentPnL, new Date());
+                        console.log(`📊 Captured PnL before window rotation: ${fullMarketName} | PnL: $${currentPnL.toFixed(2)}`);
+                    }).catch(() => {
+                        // Fallback to sync version
+                        const currentPnL = this.calculateCurrentPnL(marketToRemove);
+                        const fullMarketName = marketToRemove.marketName || marketToRemove.marketKey;
+                        this.logSimplePnlToCsv(fullMarketName, currentPnL, new Date());
+                        console.log(`📊 Captured PnL before window rotation (fallback): ${fullMarketName} | PnL: $${currentPnL.toFixed(2)}`);
+                    });
+                    this.pnlCapturedMarkets.add(key);
+                }
+            }
             this.markets.delete(key);
         }
     }
@@ -1639,6 +1831,9 @@ class MarketTracker {
             return; // Not the current active market, skip logging
         }
 
+        // Check and capture PnL 5 seconds before market closes
+        this.checkAndCapturePnLBeforeClose(market);
+
         // Log prices to CSV for live chart
         const priceUp = market.currentPriceUp ?? 0;
         const priceDown = market.currentPriceDown ?? 0;
@@ -1747,12 +1942,30 @@ class MarketTracker {
                 // Only log markets that have actual investment (not just stale with no trades)
                 if (value.investedUp > 0 || value.investedDown > 0) {
                     closedMarkets.push(value);
+                    // Capture to simple PnL CSV before deletion with live prices
+                    if (!this.pnlCapturedMarkets.has(key)) {
+                        const marketToCapture = value;
+                        const marketKey = key;
+                        // Use async version to fetch live prices if needed
+                        this.calculateCurrentPnLWithLivePrices(marketToCapture).then(currentPnL => {
+                            const fullMarketName = marketToCapture.marketName || marketToCapture.marketKey;
+                            this.logSimplePnlToCsv(fullMarketName, currentPnL, new Date());
+                            console.log(`📊 Captured PnL on market close: ${fullMarketName} | PnL: $${currentPnL.toFixed(2)}`);
+                        }).catch(() => {
+                            // Fallback to sync version
+                            const currentPnL = this.calculateCurrentPnL(marketToCapture);
+                            const fullMarketName = marketToCapture.marketName || marketToCapture.marketKey;
+                            this.logSimplePnlToCsv(fullMarketName, currentPnL, new Date());
+                            console.log(`📊 Captured PnL on market close (fallback): ${fullMarketName} | PnL: $${currentPnL.toFixed(2)}`);
+                        });
+                        this.pnlCapturedMarkets.add(marketKey);
+                    }
                 }
                 this.markets.delete(key);
             }
         }
 
-        // Log closed markets to CSV (async, don't wait)
+        // Log closed markets to detailed CSV (async - for full breakdown)
         if (closedMarkets.length > 0) {
             // Log each closed market
             closedMarkets.forEach(market => {
@@ -1923,7 +2136,7 @@ class MarketTracker {
                 }
             }
             paperCurrentCapital = Math.max(0, paperCurrentCapital); // Don't go negative
-            outputLines.push(chalk.gray(`  Strategy: Dual-side accumulation (independent trader)`));
+            outputLines.push(chalk.gray(`  Strategy: Stochastic accumulation | Safety-first recovery (independent trader)`));
             outputLines.push(chalk.gray(`  Starting Capital: $${paperStartingCapital.toFixed(2)} | Available: $${paperCurrentCapital.toFixed(2)} | Portfolio: $${paperPortfolioValue.toFixed(2)}`));
             outputLines.push(chalk.gray(`  Active Markets: ${sortedMarkets.length}/${this.maxMarkets} | Trading on same markets as watcher mode`));
         } else if (ENV.USER_ADDRESSES.length > 0) {
@@ -2712,7 +2925,23 @@ class MarketTracker {
             if (is15Min) {
                 const existingMarket = this.markets.get(marketKey);
                 if (existingMarket && existingMarket.marketSlug !== slug) {
-                    // Old window - remove it
+                    // Old window - capture PnL before removing!
+                    if (!this.pnlCapturedMarkets.has(marketKey)) {
+                        const marketToCapture = existingMarket;
+                        // Use async version to fetch live prices if needed
+                        this.calculateCurrentPnLWithLivePrices(marketToCapture).then(currentPnL => {
+                            const fullMarketName = marketToCapture.marketName || marketToCapture.marketKey;
+                            this.logSimplePnlToCsv(fullMarketName, currentPnL, new Date());
+                            console.log(`📊 Captured PnL before 15m discovery rotation: ${fullMarketName} | PnL: $${currentPnL.toFixed(2)}`);
+                        }).catch(() => {
+                            // Fallback to sync version
+                            const currentPnL = this.calculateCurrentPnL(marketToCapture);
+                            const fullMarketName = marketToCapture.marketName || marketToCapture.marketKey;
+                            this.logSimplePnlToCsv(fullMarketName, currentPnL, new Date());
+                            console.log(`📊 Captured PnL before 15m discovery rotation (fallback): ${fullMarketName} | PnL: $${currentPnL.toFixed(2)}`);
+                        });
+                        this.pnlCapturedMarkets.add(marketKey);
+                    }
                     this.markets.delete(marketKey);
                 }
             }

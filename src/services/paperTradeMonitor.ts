@@ -41,6 +41,67 @@ function debugLog(message: string): void {
     }
 }
 
+// CSV file for PnL records
+const pnlCsvPath = path.join(process.cwd(), 'logs', 'pnl_records.csv');
+
+/**
+ * Initialize CSV file with headers if it doesn't exist
+ */
+function initializePnlCsv(): void {
+    try {
+        // Ensure logs directory exists
+        const logsDir = path.dirname(pnlCsvPath);
+        if (!fs.existsSync(logsDir)) {
+            fs.mkdirSync(logsDir, { recursive: true });
+        }
+
+        if (!fs.existsSync(pnlCsvPath)) {
+            const header = 'Market Name,Completion Time,PnL\n';
+            fs.writeFileSync(pnlCsvPath, header);
+        }
+    } catch (e) {
+        // Ignore errors - CSV logging shouldn't break the bot
+        debugLog(`Error initializing PnL CSV: ${e}`);
+    }
+}
+
+/**
+ * Log market completion PnL to CSV file
+ */
+function logPnlToCsv(marketName: string, pnl: number, captureTime?: Date): void {
+    try {
+        // Ensure CSV file exists with headers
+        if (!fs.existsSync(pnlCsvPath)) {
+            initializePnlCsv();
+        }
+
+        // Format: Market Name, Completion Time, PnL
+        const completionTime = captureTime ? captureTime.toISOString() : new Date().toISOString();
+        const csvLine = `"${marketName}",${completionTime},${pnl.toFixed(2)}\n`;
+        fs.appendFileSync(pnlCsvPath, csvLine);
+    } catch (e) {
+        // Ignore errors - CSV logging shouldn't break the bot
+        debugLog(`Error writing PnL to CSV: ${e}`);
+    }
+}
+
+/**
+ * Calculate current PnL for a position based on current prices
+ */
+function calculateCurrentPnL(position: MarketPosition, priceUp: number, priceDown: number): number {
+    const totalCost = position.costUp + position.costDown + position.arbCostUp + position.arbCostDown;
+    
+    // Calculate current value based on current prices
+    const currentValueUp = (position.sharesUp + position.arbSharesUp) * priceUp;
+    const currentValueDown = (position.sharesDown + position.arbSharesDown) * priceDown;
+    const totalCurrentValue = currentValueUp + currentValueDown;
+    
+    return totalCurrentValue - totalCost;
+}
+
+// Initialize CSV on module load
+initializePnlCsv();
+
 // =============================================================================
 // CONFIGURATION - PURELY PARAMETER-BASED
 // All trading logic comes from params_latest.json - no hardcoded values
@@ -61,7 +122,8 @@ const SIMPLE_5050_POLICY = process.env.SIMPLE_5050_POLICY !== 'false';
 // Only keep essential constants for system operation
 // Use FETCH_INTERVAL as a baseline so paper mode doesn't run orders of magnitude
 // faster than watch mode. Clamp to a reasonable lower bound for responsiveness.
-const POLL_INTERVAL_MS = Math.max(100, FETCH_INTERVAL * 1000); // Main loop cadence
+// Watcher trades ~25/sec, so 100ms (10/sec) is a good baseline.
+const POLL_INTERVAL_MS = 100; // Main loop cadence - fixed at 100ms for high-frequency parity
 const EXPIRATION_WINDOW_MS = 2 * 60 * 1000; // Stop trading 2 min before expiration (safety)
 
 if (!USER_ADDRESSES || USER_ADDRESSES.length === 0) {
@@ -111,6 +173,9 @@ const discoveredConditionIds = new Set<string>();
 
 // Track processed trades in memory
 const processedTrades = new Set<string>();
+
+// Track markets that have already had their PnL captured 5 seconds before close
+const pnlCapturedMarkets = new Set<string>();
 
 interface MarketPosition {
     conditionId: string;
@@ -1580,9 +1645,18 @@ async function buildPositionIncrementally(market: typeof discoveredMarkets exten
         const features = policyEngine.computeFeatures(tapeState, priceHistory);
 
         const priceSum = tapeState.up_px + tapeState.down_px;
-        const maxDeviation = marketParams.quality_filter_params?.max_price_sum_deviation ?? 0.1;
+        const baseMaxDev = marketParams.quality_filter_params?.max_price_sum_deviation ?? 0.05;
+        const is15m = paramMarketKey.endsWith('_15m');
+        const is1h = paramMarketKey.endsWith('_1h');
+        // Loosen data-quality filter for 15m (more jittery), keep tighter for 1h
+        const devMultiplier = is15m ? 5 : 2;
+        const maxDeviation = baseMaxDev * devMultiplier;
         if (Math.abs(priceSum - 1.0) > maxDeviation) {
-            debugLog(`[SimplePolicy] ${market.marketKey}: Skipped (price sum deviation ${Math.abs(priceSum - 1.0).toFixed(4)} > ${maxDeviation})`);
+            debugLog(
+                `[SimplePolicy] ${market.marketKey}: Skipped (price sum deviation ${Math.abs(priceSum - 1.0).toFixed(
+                    4
+                )} > ${maxDeviation})`
+            );
             return;
         }
 
@@ -1595,9 +1669,14 @@ async function buildPositionIncrementally(market: typeof discoveredMarkets exten
             now
         );
         if (!cadenceOk) {
-            debugLog(`[SimplePolicy] ${market.marketKey}: Cadence blocked (lastTrade=${cadenceInfo.lastTradeTime}, recent=${cadenceInfo.recentTradeTimes.length})`);
+            debugLog(
+                `[SimplePolicy] ${market.marketKey}: Cadence blocked (lastTrade=${cadenceInfo.lastTradeTime}, recent=${cadenceInfo.recentTradeTimes.length})`
+            );
             return;
         }
+
+        // Extra simple gap for 1h markets removed to match watcher frequency
+        // (Watcher trades multiple times per second on 1h markets too)
 
         const inventoryState = policyIntegrator.getInventoryState(paramMarketKey);
         const tradesThisSessionApprox = cadenceInfo.recentTradeTimes.length;
@@ -1613,8 +1692,14 @@ async function buildPositionIncrementally(market: typeof discoveredMarkets exten
         // Winning side = higher-priced side; normalize so UP+DOWN≈1 before tilt
         const normalizedUp = priceSum > 0 ? tapeState.up_px / priceSum : 0.5;
         const diffFromHalf = normalizedUp - 0.5; // positive -> UP winning, negative -> DOWN winning
-        const maxTilt = 0.2; // max +/-20% away from 50/50
-        const tilt = Math.max(-maxTilt, Math.min(maxTilt, diffFromHalf * 2)); // scale diff into [-maxTilt, maxTilt]
+        
+        // Sharpened tilt to match watcher's "corrected" replica behavior:
+        // - At neutral (<10% skew): ~50/50 target
+        // - At high (>30% skew): ~65% target for the winner
+        // Using a continuous slope of 0.5x diffFromHalf, capped at 0.15 (gives 65/35 target)
+        // This is the "safe" favoring of the winner.
+        const maxTilt = 0.15;
+        const tilt = Math.max(-maxTilt, Math.min(maxTilt, diffFromHalf * 0.5));
         const targetUpFrac = 0.5 + tilt;
         const targetDownFrac = 1 - targetUpFrac;
 
@@ -1639,29 +1724,40 @@ async function buildPositionIncrementally(market: typeof discoveredMarkets exten
                 )} shares, DOWN=${proposedDownShares.toFixed(4)} shares`
             );
         } else {
-            // Choose side that moves us toward targetUpFrac
+            // STOCHASTIC SIDE SELECTION (Mirroring Watcher Trade Counts):
+            // Instead of buying both sides every cycle (which leads to 1:1 trade counts),
+            // we pick ONE side based on the target distribution.
+            // This allows the trade counts (e.g., 85 UP vs 114 DOWN) to diverge like the watcher.
+            
+            // "Safe Way" Inventory Correction:
+            // If our current distribution drifts > 5% from target, force the corrective side.
+            const drift = currentUpFrac - targetUpFrac;
             let sideToTrade: 'UP' | 'DOWN';
-            if (currentUpFrac < targetUpFrac) {
-                sideToTrade = 'UP';
-            } else if (currentUpFrac > targetUpFrac) {
-                sideToTrade = 'DOWN';
+            
+            if (drift > 0.05) {
+                sideToTrade = 'DOWN'; // Force DOWN to correct UP over-weighting
+                debugLog(`[SimplePolicy] ${market.marketKey}: SAFETY - Forcing DOWN to correct drift (${drift.toFixed(3)})`);
+            } else if (drift < -0.05) {
+                sideToTrade = 'UP'; // Force UP to correct DOWN over-weighting
+                debugLog(`[SimplePolicy] ${market.marketKey}: SAFETY - Forcing UP to correct drift (${drift.toFixed(3)})`);
             } else {
-                sideToTrade = diffFromHalf >= 0 ? 'UP' : 'DOWN';
+                // Otherwise pick side stochastically based on target fraction
+                sideToTrade = Math.random() < targetUpFrac ? 'UP' : 'DOWN';
             }
 
             const rawShares = policyEngine.sizeForTrade(tapeState, features, marketParams.size_params, sideToTrade, inventoryState);
-            const scaledShares = rawShares * sizeScale;
+            
+            // Apply sizeScale and a slight reduction (0.85x) to match watcher's lower capital usage
+            const finalShares = rawShares * sizeScale * 0.85;
 
             if (sideToTrade === 'UP') {
-                proposedUpShares = scaledShares;
+                proposedUpShares = finalShares;
             } else {
-                proposedDownShares = scaledShares;
+                proposedDownShares = finalShares;
             }
 
             debugLog(
-                `[SimplePolicy] ${market.marketKey}: Side=${sideToTrade}, proposedShares=${scaledShares.toFixed(
-                    4
-                )}, targetUpFrac=${targetUpFrac.toFixed(3)}`
+                `[SimplePolicy] ${market.marketKey}: Side=${sideToTrade}, proposedShares=${finalShares.toFixed(2)}, targetUpFrac=${targetUpFrac.toFixed(3)}`
             );
         }
 
@@ -2159,6 +2255,12 @@ async function settlePosition(position: MarketPosition, upWon: boolean, downWon:
     Logger.info(`💰 SETTLED: ${position.marketKey} | Winner: ${upWon ? 'UP' : (downWon ? 'DOWN' : 'UNCLEAR')} | Cost: $${totalCost.toFixed(2)} → Value: $${finalValue.toFixed(2)} | PnL: ${pnlSign}$${pnl.toFixed(2)} (${pnlSign}${pnlPercent}%)`);
     debugLog(`SETTLED position: ${position.marketKey} (key: ${position.conditionId}), endDate was: ${position.endDate}`);
 
+    // Log PnL to CSV file (only if not already captured 5s before close)
+    if (!pnlCapturedMarkets.has(position.conditionId)) {
+        const fullMarketName = position.marketName || position.marketKey;
+        logPnlToCsv(fullMarketName, pnl);
+    }
+
     // Trigger display update
     marketTracker.forceDisplayUpdate();
 
@@ -2231,7 +2333,7 @@ function displayStatus(): void {
     // Header
     lines.push(chalk.cyan('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
     lines.push(chalk.cyan.bold(`  🤖 PAPER TRADING MODE                                         ${etTime} ET`));
-    lines.push(chalk.gray('  Strategy: Dual-side accumulation | Mirroring watcher patterns'));
+    lines.push(chalk.gray('  Strategy: Stochastic accumulation | Safety-first recovery | Mirroring watcher patterns'));
     lines.push(chalk.cyan('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
     lines.push('');
 
@@ -2902,11 +3004,31 @@ const paperTradeMonitor = async () => {
 
                 // Debug log every iteration to see what state each market is in
                 let timeLeft = 0;
+                let endDateMs = 0;
                 if (market.endDate && market.endDate > 0) {
                     // If endDate is less than 10000000000, it's likely in seconds, convert to ms
-                    const endDateMs = market.endDate < 10000000000 ? market.endDate * 1000 : market.endDate;
+                    endDateMs = market.endDate < 10000000000 ? market.endDate * 1000 : market.endDate;
                     const timeDiff = endDateMs - now;
                     timeLeft = Math.max(0, Math.floor(timeDiff / 60000)); // Ensure non-negative
+                    
+                    // Capture PnL 5 seconds before market closes
+                    const timeToClose = endDateMs - now;
+                    const FIVE_SECONDS_MS = 5 * 1000;
+                    if (position && !position.isSettled && timeToClose > 0 && timeToClose <= FIVE_SECONDS_MS && !pnlCapturedMarkets.has(conditionId)) {
+                        // Get current prices
+                        const priceUp = market.priceUp ?? position.currentPriceUp ?? 0.5;
+                        const priceDown = market.priceDown ?? position.currentPriceDown ?? 0.5;
+                        
+                        // Calculate current PnL
+                        const currentPnL = calculateCurrentPnL(position, priceUp, priceDown);
+                        
+                        // Log to CSV with full market name
+                        const fullMarketName = position.marketName || position.marketKey;
+                        const captureTime = new Date(now);
+                        logPnlToCsv(fullMarketName, currentPnL, captureTime);
+                        pnlCapturedMarkets.add(conditionId);
+                        debugLog(`📊 Captured PnL 5s before close: ${fullMarketName} | PnL: $${currentPnL.toFixed(2)}`);
+                    }
                 }
                 const hasAssets = market.assetUp && market.assetDown;
                 if (!hasAssets) {

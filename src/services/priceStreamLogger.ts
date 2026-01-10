@@ -1265,6 +1265,13 @@ class PriceStreamLogger {
     // Return null to let caller use passed-in prices instead of stale historical data
     return null;
   }
+
+  /**
+   * Get current markets from market discovery (for dashboard sync)
+   */
+  getCurrentMarkets(): Map<string, MarketInfo> {
+    return this.marketDiscovery.getCurrentMarkets();
+  }
 }
 
 // Create singleton instance

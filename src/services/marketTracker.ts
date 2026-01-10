@@ -5,6 +5,7 @@ import { ENV } from '../config/env';
 import fetchData from '../utils/fetchData';
 import priceStreamLogger from './priceStreamLogger';
 import { getRunId } from '../utils/runId';
+import watcherPnLTracker from './watcherPnLTracker';
 
 /**
  * Helper function to break down timestamp into detailed components
@@ -66,7 +67,6 @@ class MarketTracker {
     private loggedMarkets: Set<string> = new Set(); // Track markets already logged to CSV
     private pnlCapturedMarkets: Set<string> = new Set(); // Track markets that have had PnL captured 5s before close
     private csvFilePath: string;
-    private simplePnlCsvPath: string; // Simple CSV for watcher PnL records
     private maxMarkets = 4; // Maximum number of markets to track at once
     private marketsToClose: MarketStats[] = []; // Markets that need to be closed
     private onMarketCloseCallback?: (market: MarketStats) => Promise<void>; // Callback for closing positions
@@ -94,49 +94,6 @@ class MarketTracker {
         const runId = getRunId();
         this.csvFilePath = path.join(targetDir, `${fileName}_${runId}.csv`);
         this.initializeCsvFile();
-        
-        // Initialize simple PnL CSV for watcher mode only
-        if (!isPaperMode) {
-            this.simplePnlCsvPath = path.join(logsDir, 'watcher_pnl_records.csv');
-            this.initializeSimplePnlCsv();
-        } else {
-            this.simplePnlCsvPath = '';
-        }
-    }
-
-    /**
-     * Initialize simple PnL CSV file with headers (for watcher mode only)
-     */
-    private initializeSimplePnlCsv(): void {
-        try {
-            if (!fs.existsSync(this.simplePnlCsvPath)) {
-                const header = 'Market Name,Completion Time,PnL\n';
-                fs.writeFileSync(this.simplePnlCsvPath, header, 'utf8');
-            }
-        } catch (error) {
-            console.error(`Failed to initialize simple PnL CSV: ${error}`);
-        }
-    }
-
-    /**
-     * Log market completion PnL to simple CSV file (watcher mode only)
-     */
-    private logSimplePnlToCsv(marketName: string, pnl: number, captureTime?: Date): void {
-        if (!this.simplePnlCsvPath) return; // Skip if not in watcher mode
-        
-        try {
-            // Ensure CSV file exists with headers
-            if (!fs.existsSync(this.simplePnlCsvPath)) {
-                this.initializeSimplePnlCsv();
-            }
-
-            // Format: Market Name, Completion Time, PnL
-            const completionTime = captureTime ? captureTime.toISOString() : new Date().toISOString();
-            const csvLine = `"${marketName.replace(/"/g, '""')}",${completionTime},${pnl.toFixed(2)}\n`;
-            fs.appendFileSync(this.simplePnlCsvPath, csvLine, 'utf8');
-        } catch (error) {
-            console.error(`Failed to write simple PnL to CSV: ${error}`);
-        }
     }
 
     /**
@@ -215,31 +172,6 @@ class MarketTracker {
 
         const totalFinalValue = finalValueUp + finalValueDown;
         return totalFinalValue - totalCostBasis;
-    }
-
-    /**
-     * Check and capture PnL 5 seconds before market closes
-     */
-    private checkAndCapturePnLBeforeClose(market: MarketStats): void {
-        if (!market.endDate || !this.simplePnlCsvPath) return; // Skip if no endDate or not in watcher mode
-        
-        const now = Date.now();
-        const endDateMs = market.endDate < 10000000000 ? market.endDate * 1000 : market.endDate;
-        const timeToClose = endDateMs - now;
-        const FIVE_SECONDS_MS = 5 * 1000;
-        
-        // Check if we're 5 seconds before close and haven't captured yet
-        if (timeToClose > 0 && timeToClose <= FIVE_SECONDS_MS && !this.pnlCapturedMarkets.has(market.marketKey)) {
-            // Calculate current PnL
-            const currentPnL = this.calculateCurrentPnL(market);
-            
-            // Log to CSV with full market name
-            const fullMarketName = market.marketName || market.marketKey;
-            const captureTime = new Date(now);
-            this.logSimplePnlToCsv(fullMarketName, currentPnL, captureTime);
-            this.pnlCapturedMarkets.add(market.marketKey);
-            console.log(`📊 Captured PnL 5s before close: ${fullMarketName} | PnL: $${currentPnL.toFixed(2)}`);
-        }
     }
 
     /**
@@ -446,12 +378,6 @@ class MarketTracker {
         try {
             fs.appendFileSync(this.csvFilePath, row + '\n', 'utf8');
             this.loggedMarkets.add(market.marketKey);
-            
-            // Also log to simple CSV for watcher mode (only if not already captured 5s before close)
-            if (!this.pnlCapturedMarkets.has(market.marketKey)) {
-                const fullMarketName = market.marketName || market.marketKey;
-                this.logSimplePnlToCsv(fullMarketName, totalPnl);
-            }
         } catch (error) {
             console.error(`Failed to write PnL to CSV: ${error}`);
         }
@@ -963,19 +889,47 @@ class MarketTracker {
                     // Use async version to fetch live prices if needed
                     this.calculateCurrentPnLWithLivePrices(marketToRemove).then(currentPnL => {
                         const fullMarketName = marketToRemove.marketName || marketToRemove.marketKey;
-                        this.logSimplePnlToCsv(fullMarketName, currentPnL, new Date());
                         console.log(`📊 Captured PnL before rotation: ${fullMarketName} | PnL: $${currentPnL.toFixed(2)}`);
+                        // Log to watcher PnL tracker for TXT report
+                        watcherPnLTracker.logMarketPnL(
+                            fullMarketName,
+                            marketToRemove.conditionId || '',
+                            marketToRemove.marketKey,
+                            marketToRemove.sharesUp,
+                            marketToRemove.sharesDown,
+                            marketToRemove.totalCostUp,
+                            marketToRemove.totalCostDown,
+                            marketToRemove.currentPriceUp || 0,
+                            marketToRemove.currentPriceDown || 0,
+                            marketToRemove.tradesUp,
+                            marketToRemove.tradesDown
+                        );
                     }).catch(() => {
                         // Fallback to sync version
                         const currentPnL = this.calculateCurrentPnL(marketToRemove);
                         const fullMarketName = marketToRemove.marketName || marketToRemove.marketKey;
-                        this.logSimplePnlToCsv(fullMarketName, currentPnL, new Date());
                         console.log(`📊 Captured PnL before rotation (fallback): ${fullMarketName} | PnL: $${currentPnL.toFixed(2)}`);
+                        // Log to watcher PnL tracker for TXT report
+                        watcherPnLTracker.logMarketPnL(
+                            fullMarketName,
+                            marketToRemove.conditionId || '',
+                            marketToRemove.marketKey,
+                            marketToRemove.sharesUp,
+                            marketToRemove.sharesDown,
+                            marketToRemove.totalCostUp,
+                            marketToRemove.totalCostDown,
+                            marketToRemove.currentPriceUp || 0,
+                            marketToRemove.currentPriceDown || 0,
+                            marketToRemove.tradesUp,
+                            marketToRemove.tradesDown
+                        );
                     });
                     this.pnlCapturedMarkets.add(key);
                 }
             }
             this.markets.delete(key);
+            // Clear the key so next market window can be captured
+            this.pnlCapturedMarkets.delete(key);
         }
     }
 
@@ -1050,19 +1004,47 @@ class MarketTracker {
                     // Use async version to fetch live prices if needed
                     this.calculateCurrentPnLWithLivePrices(marketToRemove).then(currentPnL => {
                         const fullMarketName = marketToRemove.marketName || marketToRemove.marketKey;
-                        this.logSimplePnlToCsv(fullMarketName, currentPnL, new Date());
                         console.log(`📊 Captured PnL before window rotation: ${fullMarketName} | PnL: $${currentPnL.toFixed(2)}`);
+                        // Log to watcher PnL tracker for TXT report
+                        watcherPnLTracker.logMarketPnL(
+                            fullMarketName,
+                            marketToRemove.conditionId || '',
+                            marketToRemove.marketKey,
+                            marketToRemove.sharesUp,
+                            marketToRemove.sharesDown,
+                            marketToRemove.totalCostUp,
+                            marketToRemove.totalCostDown,
+                            marketToRemove.currentPriceUp || 0,
+                            marketToRemove.currentPriceDown || 0,
+                            marketToRemove.tradesUp,
+                            marketToRemove.tradesDown
+                        );
                     }).catch(() => {
                         // Fallback to sync version
                         const currentPnL = this.calculateCurrentPnL(marketToRemove);
                         const fullMarketName = marketToRemove.marketName || marketToRemove.marketKey;
-                        this.logSimplePnlToCsv(fullMarketName, currentPnL, new Date());
                         console.log(`📊 Captured PnL before window rotation (fallback): ${fullMarketName} | PnL: $${currentPnL.toFixed(2)}`);
+                        // Log to watcher PnL tracker for TXT report
+                        watcherPnLTracker.logMarketPnL(
+                            fullMarketName,
+                            marketToRemove.conditionId || '',
+                            marketToRemove.marketKey,
+                            marketToRemove.sharesUp,
+                            marketToRemove.sharesDown,
+                            marketToRemove.totalCostUp,
+                            marketToRemove.totalCostDown,
+                            marketToRemove.currentPriceUp || 0,
+                            marketToRemove.currentPriceDown || 0,
+                            marketToRemove.tradesUp,
+                            marketToRemove.tradesDown
+                        );
                     });
                     this.pnlCapturedMarkets.add(key);
                 }
             }
             this.markets.delete(key);
+            // Clear the key so next market window can be captured
+            this.pnlCapturedMarkets.delete(key);
         }
     }
 
@@ -1831,9 +1813,6 @@ class MarketTracker {
             return; // Not the current active market, skip logging
         }
 
-        // Check and capture PnL 5 seconds before market closes
-        this.checkAndCapturePnLBeforeClose(market);
-
         // Log prices to CSV for live chart
         const priceUp = market.currentPriceUp ?? 0;
         const priceDown = market.currentPriceDown ?? 0;
@@ -1942,26 +1921,54 @@ class MarketTracker {
                 // Only log markets that have actual investment (not just stale with no trades)
                 if (value.investedUp > 0 || value.investedDown > 0) {
                     closedMarkets.push(value);
-                    // Capture to simple PnL CSV before deletion with live prices
+                    // Capture PnL before deletion with live prices
                     if (!this.pnlCapturedMarkets.has(key)) {
                         const marketToCapture = value;
                         const marketKey = key;
                         // Use async version to fetch live prices if needed
                         this.calculateCurrentPnLWithLivePrices(marketToCapture).then(currentPnL => {
                             const fullMarketName = marketToCapture.marketName || marketToCapture.marketKey;
-                            this.logSimplePnlToCsv(fullMarketName, currentPnL, new Date());
                             console.log(`📊 Captured PnL on market close: ${fullMarketName} | PnL: $${currentPnL.toFixed(2)}`);
+                            // Log to watcher PnL tracker for TXT report
+                            watcherPnLTracker.logMarketPnL(
+                                fullMarketName,
+                                marketToCapture.conditionId || '',
+                                marketToCapture.marketKey,
+                                marketToCapture.sharesUp,
+                                marketToCapture.sharesDown,
+                                marketToCapture.totalCostUp,
+                                marketToCapture.totalCostDown,
+                                marketToCapture.currentPriceUp || 0,
+                                marketToCapture.currentPriceDown || 0,
+                                marketToCapture.tradesUp,
+                                marketToCapture.tradesDown
+                            );
                         }).catch(() => {
                             // Fallback to sync version
                             const currentPnL = this.calculateCurrentPnL(marketToCapture);
                             const fullMarketName = marketToCapture.marketName || marketToCapture.marketKey;
-                            this.logSimplePnlToCsv(fullMarketName, currentPnL, new Date());
                             console.log(`📊 Captured PnL on market close (fallback): ${fullMarketName} | PnL: $${currentPnL.toFixed(2)}`);
+                            // Log to watcher PnL tracker for TXT report
+                            watcherPnLTracker.logMarketPnL(
+                                fullMarketName,
+                                marketToCapture.conditionId || '',
+                                marketToCapture.marketKey,
+                                marketToCapture.sharesUp,
+                                marketToCapture.sharesDown,
+                                marketToCapture.totalCostUp,
+                                marketToCapture.totalCostDown,
+                                marketToCapture.currentPriceUp || 0,
+                                marketToCapture.currentPriceDown || 0,
+                                marketToCapture.tradesUp,
+                                marketToCapture.tradesDown
+                            );
                         });
                         this.pnlCapturedMarkets.add(marketKey);
                     }
                 }
                 this.markets.delete(key);
+                // Clear the key so next market window can be captured
+                this.pnlCapturedMarkets.delete(key);
             }
         }
 
@@ -2931,18 +2938,46 @@ class MarketTracker {
                         // Use async version to fetch live prices if needed
                         this.calculateCurrentPnLWithLivePrices(marketToCapture).then(currentPnL => {
                             const fullMarketName = marketToCapture.marketName || marketToCapture.marketKey;
-                            this.logSimplePnlToCsv(fullMarketName, currentPnL, new Date());
                             console.log(`📊 Captured PnL before 15m discovery rotation: ${fullMarketName} | PnL: $${currentPnL.toFixed(2)}`);
+                            // Log to watcher PnL tracker for TXT report
+                            watcherPnLTracker.logMarketPnL(
+                                fullMarketName,
+                                marketToCapture.conditionId || '',
+                                marketToCapture.marketKey,
+                                marketToCapture.sharesUp,
+                                marketToCapture.sharesDown,
+                                marketToCapture.totalCostUp,
+                                marketToCapture.totalCostDown,
+                                marketToCapture.currentPriceUp || 0,
+                                marketToCapture.currentPriceDown || 0,
+                                marketToCapture.tradesUp,
+                                marketToCapture.tradesDown
+                            );
                         }).catch(() => {
                             // Fallback to sync version
                             const currentPnL = this.calculateCurrentPnL(marketToCapture);
                             const fullMarketName = marketToCapture.marketName || marketToCapture.marketKey;
-                            this.logSimplePnlToCsv(fullMarketName, currentPnL, new Date());
                             console.log(`📊 Captured PnL before 15m discovery rotation (fallback): ${fullMarketName} | PnL: $${currentPnL.toFixed(2)}`);
+                            // Log to watcher PnL tracker for TXT report
+                            watcherPnLTracker.logMarketPnL(
+                                fullMarketName,
+                                marketToCapture.conditionId || '',
+                                marketToCapture.marketKey,
+                                marketToCapture.sharesUp,
+                                marketToCapture.sharesDown,
+                                marketToCapture.totalCostUp,
+                                marketToCapture.totalCostDown,
+                                marketToCapture.currentPriceUp || 0,
+                                marketToCapture.currentPriceDown || 0,
+                                marketToCapture.tradesUp,
+                                marketToCapture.tradesDown
+                            );
                         });
                         this.pnlCapturedMarkets.add(marketKey);
                     }
                     this.markets.delete(marketKey);
+                    // Clear the key so next market window can be captured
+                    this.pnlCapturedMarkets.delete(marketKey);
                 }
             }
 
@@ -2999,6 +3034,67 @@ class MarketTracker {
                 // Force display update
                 this.lastDisplayTime = 0;
             }
+        }
+
+        // Also sync current markets from priceStreamLogger so that 1-hour
+        // markets appear immediately on the dashboard, even before any trades.
+        const currentMarkets = priceStreamLogger.getCurrentMarkets();
+        for (const [marketType, info] of currentMarkets.entries()) {
+            const is15MinType = marketType.includes('15m');
+            const is1HourType = marketType.includes('up-or-down') && !marketType.includes('15m');
+            if (!is15MinType && !is1HourType) continue;
+
+            const isBTCType = marketType.includes('btc') || marketType.includes('bitcoin');
+
+            // Build dashboard marketKey
+            let marketKey: string | null = null;
+            if (is15MinType) {
+                marketKey = isBTCType ? 'BTC-UpDown-15' : 'ETH-UpDown-15';
+            } else if (is1HourType) {
+                // Extract hour number from question or slug (e.g., ", 2PM ET" or "-2pm-et")
+                const question = info.question || '';
+                const slug = (info.slug || '').toLowerCase();
+                let hourNum = '0';
+
+                const questionMatch = question.match(/,\s*(\d{1,2})\s*(AM|PM)\s*ET/i);
+                const slugMatch = slug.match(/-(\d{1,2})(am|pm)-et$/i);
+                if (questionMatch) {
+                    hourNum = questionMatch[1];
+                } else if (slugMatch) {
+                    hourNum = slugMatch[1];
+                }
+
+                marketKey = isBTCType ? `BTC-UpDown-1h-${hourNum}` : `ETH-UpDown-1h-${hourNum}`;
+            }
+
+            if (!marketKey) continue;
+
+            // Determine UP/DOWN asset IDs from tokens
+            let assetUp = '';
+            let assetDown = '';
+            if (info.tokens && info.tokens.length >= 2) {
+                const upToken =
+                    info.tokens.find((t: any) => t.outcome && t.outcome.toUpperCase().includes('UP')) ||
+                    info.tokens[0];
+                const downToken =
+                    info.tokens.find((t: any) => t.outcome && t.outcome.toUpperCase().includes('DOWN')) ||
+                    info.tokens[1];
+
+                assetUp = upToken.token_id;
+                assetDown = downToken.token_id;
+            }
+
+            const endDateMs = info.end_date_iso ? new Date(info.end_date_iso).getTime() : undefined;
+
+            this.ensureMarketWithAssets(
+                marketKey,
+                info.question || info.slug || marketKey,
+                info.slug || '',
+                info.condition_id,
+                assetUp,
+                assetDown,
+                endDateMs
+            );
         }
 
         // Clean up old slugs from discoveredSlugs (prevent memory leak)

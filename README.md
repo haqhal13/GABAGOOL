@@ -46,24 +46,23 @@ npm run health-check  # Verify configuration
 npm start             # Start bot (interactive mode selection)
 ```
 
-When you run `npm start`, you'll be prompted to select a mode:
-- Paper Mode (simulated trading)
-- Watcher Mode (monitoring only)
-- Trading Mode (real execution)
+When you run `npm start`, the bot automatically selects a mode. In CI/Render environments it defaults to **Watcher** mode, while in a local terminal you'll be prompted to choose Watcher or Trading.
 
-You can also set modes via environment variables:
+You can also set the mode explicitly via environment variables:
 ```bash
-PAPER_MODE=true npm start        # Paper mode
-TRACK_ONLY_MODE=true npm start   # Watcher mode
-npm start                        # Trading mode (default)
+MODE=WATCH npm start             # Force watcher mode (monitor only)
+MODE=TRADING npm start           # Run in live trading mode
+TRACK_ONLY_MODE=true npm start   # Legacy flag – also enables watcher mode
 ```
+
+📌 **Paper mode has been removed** in this lightweight build. Use Watcher mode for dry-runs.
 
 **📖 For detailed setup instructions, see [Getting Started Guide](./docs/GETTING_STARTED.md)**
 **📖 For quick run instructions, see [Quick Run Guide](./README_RUN.md)**
 
 ## Features
 
-- **Three Operating Modes** - Paper trading, Watcher mode, and Live trading
+- **Two Operating Modes** - Watcher (read-only) and Live trading with a shared code path
 - **Multi-Trader Support** - Track and copy trades from multiple traders simultaneously
 - **Smart Position Sizing** - Automatically adjusts trade sizes based on your capital
 - **Tiered Multipliers** - Apply different multipliers based on trade size
@@ -72,34 +71,33 @@ npm start                        # Trading mode (default)
 - **Real-time Execution** - Monitors trades every second and executes instantly
 - **MongoDB Integration** - Persistent storage of all trades and positions
 - **Price Protection** - Built-in slippage checks to avoid unfavorable fills
-- **Comprehensive Logging** - CSV logs for trades, PnL, and price streams organized by mode
+- **Web App Streaming** - Built-in HTTP API plus optional webhook pushes instead of CSV files
 
 ### Operating Modes
 
-The bot supports three distinct modes that you can select when starting:
+The lightweight build ships with two runtime modes:
 
-1. **📊 Paper Mode** - Independent paper trading simulation
-   - Simulates trading without using real money
-   - Discovers markets independently using same criteria as watcher
-   - Perfect for testing strategies and understanding market behavior
-   - Logs saved to `logs/paper/`
+1. **👀 Watcher Mode** – Monitor trader activity (read-only).
+   - Tracks trader positions from the addresses in `USER_ADDRESSES`.
+   - Streams every trade/position update to the console, `/state` API, and optional webhook.
+   - Does not require a funded wallet or MongoDB (falls back to in-memory storage).
 
-2. **👀 Watcher Mode** - Monitor trader activity (read-only)
-   - Tracks trader positions from addresses in `USER_ADDRESSES`
-   - Displays real-time dashboard with up to 4 markets
-   - Shows PnL, positions, and market statistics
-   - No trades executed - monitoring only
-   - Logs saved to `logs/watcher/`
+2. **💰 Trading Mode** – Real trading with automatic execution.
+   - Mirrors selected traders and posts orders through the Polymarket CLOB client.
+   - Shares all watcher telemetry so your web app sees identical data.
+   - **⚠️ Uses real money – trade responsibly.**
 
-3. **💰 Trading Mode** - Real trading with automatic execution
-   - Monitors traders and automatically copies their trades
-   - Executes real trades on Polymarket using your wallet
-   - Uses proportional position sizing based on capital
-   - **⚠️ Uses real money - trade with caution**
+📌 Paper mode has been removed to keep the runtime lean for Render deployments. Use Watcher mode for dry runs or connect the new web app API to visualize data without executing orders.
 
 ### Monitoring Method
 
 The bot currently uses the **Polymarket Data API** to monitor trader activity and detect new positions. The monitoring system polls trader positions at configurable intervals (default: 1 second) to ensure timely trade detection and execution.
+
+### Web App Integration
+
+- **Built-in HTTP API** – Every deployment exposes `/health` and `/state` (JSON) so dashboards can poll without touching the filesystem.
+- **Push updates** – Set `WEBAPP_PUSH_URL` (and optional `WEBAPP_API_KEY`) to stream the latest snapshot to your own web service whenever trades, positions, or health data change.
+- **Render-friendly** – The runtime no longer writes CSV files; everything is kept in memory and streamed over HTTP/webhooks.
 
 ## Configuration
 
@@ -163,6 +161,17 @@ docker-compose logs -f polymarket
 ```
 
 **📖 [Complete Docker Guide →](./docs/DOCKER.md)**
+
+## Render Deployment
+
+This repo now ships with a [`render.yaml`](./render.yaml) specification so you can deploy the bot as a Render Web Service in a few clicks:
+
+1. Push your fork to GitHub and create a new **Web Service** on Render.
+2. Point Render to the repo and select the `render.yaml` blueprint. It automatically runs `npm install && npm run build` and then `npm start`.
+3. Add the required environment variables (`USER_ADDRESSES`, `PROXY_WALLET`, `PRIVATE_KEY`, `MONGO_URI`, etc.). Set `MODE=WATCH` for monitoring-only environments or `MODE=TRADING` when you are ready to execute orders.
+4. (Optional) Provide `WEBAPP_PUSH_URL`, `WEBAPP_API_KEY`, and `PORT` so your front-end can consume the `/state` endpoint or receive webhook pushes.
+
+Render exposes the HTTP API publicly, making it simple to connect a lightweight React/Next dashboard or any webhook consumer that visualizes live bot data.
 
 ## Documentation
 

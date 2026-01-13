@@ -408,4 +408,7 @@ export const ENV = {
     MONGO_URI: process.env.MONGO_URI as string,
     RPC_URL: process.env.RPC_URL as string,
     USDC_CONTRACT_ADDRESS: process.env.USDC_CONTRACT_ADDRESS as string,
+    WEBAPP_PUSH_URL: process.env.WEBAPP_PUSH_URL || '',
+    WEBAPP_API_KEY: process.env.WEBAPP_API_KEY || '',
+    WEBAPP_PUSH_TIMEOUT_MS: parseInt(process.env.WEBAPP_PUSH_TIMEOUT_MS || '5000', 10),
 };

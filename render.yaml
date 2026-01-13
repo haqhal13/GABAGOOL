@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: edgebot
+    env: node
+    plan: starter
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: PORT
+        value: 3000
+      - key: MODE
+        value: WATCH
+      - key: USER_ADDRESSES
+        sync: false
+      - key: PROXY_WALLET
+        sync: false
+      - key: PRIVATE_KEY
+        sync: false
+      - key: RPC_URL
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      - key: WEBAPP_PUSH_URL
+        sync: false
+      - key: WEBAPP_API_KEY
+        sync: false

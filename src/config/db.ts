@@ -8,7 +8,7 @@ const connectDB = async () => {
     // In track-only mode or paper mode without MONGO_URI, skip MongoDB connection
     if ((ENV.TRACK_ONLY_MODE || ENV.PAPER_MODE) && !ENV.MONGO_URI) {
         console.log(chalk.yellow('⚠'), 'MongoDB not configured - running in memory-only mode');
-        console.log(chalk.yellow('   Trades will be logged to console and files only'));
+        console.log(chalk.yellow('   Trades will be streamed to console and the web API only'));
         return;
     }
 

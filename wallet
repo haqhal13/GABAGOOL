@@ -1,8 +1,26 @@
 # Easy Wallet Configuration
-# Just put your wallet address on the line below (or replace the default)
-# The bot will automatically use this address when you run it
-# You can also use multiple addresses by separating them with commas
-# Example: 0xABC..., 0xDEF...
-# Lines starting with # are ignored
+# ===========================
+# Add addresses below to watch traders. Lines starting with # are comments.
+#
+# METHODS TO ADD ADDRESSES:
+# 1. Edit this file - Add addresses below (one per line or comma-separated)
+# 2. Use /add command - While bot is running, type: /add 0x... [optional_alias]
+# 3. Edit watchlist.json - Direct JSON editing for advanced users
+#
+# EXAMPLES:
+#   Single address:    0x1234567890abcdef1234567890abcdef12345678
+#   Multiple (comma):  0xABC..., 0xDEF..., 0x123...
+#   Multiple (lines):  Put each address on its own line
+#
+# RUNTIME COMMANDS (type while bot is running):
+#   /add <address> [alias]   - Add new address to watch
+#   /remove <address|alias>  - Remove address from watchlist
+#   /toggle <address|alias>  - Enable/disable an address
+#   /alias <address> <name>  - Set friendly name for address
+#   /list                    - Show all watched addresses
+#   /help                    - Show all commands
+#
+# NOTE: Once watchlist.json is created (on first run), it becomes the
+# primary source for addresses. This wallet file is used as initial seed.
 
 0x6031b6eed1c97e853c6e0f03ad3ce3529351f96d

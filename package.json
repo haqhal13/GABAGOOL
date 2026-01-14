@@ -35,6 +35,7 @@
         "audit": "ts-node src/scripts/auditCopyTradingAlgorithmFixed.ts",
         "audit-old": "ts-node src/scripts/auditCopyTradingAlgorithm.ts",
         "health-check": "ts-node src/scripts/healthCheck.ts",
+        "watcher": "TRACK_ONLY_MODE=true ENABLE_WEB_DASHBOARD=true ts-node src/index.ts",
         "run": "npm start",
         "start-bot": "npm start",
         "paper-trade": "PAPER_MODE=true ts-node src/index.ts",

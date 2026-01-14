@@ -411,4 +411,7 @@ export const ENV = {
     WEBAPP_PUSH_URL: process.env.WEBAPP_PUSH_URL || '',
     WEBAPP_API_KEY: process.env.WEBAPP_API_KEY || '',
     WEBAPP_PUSH_TIMEOUT_MS: parseInt(process.env.WEBAPP_PUSH_TIMEOUT_MS || '5000', 10),
+    // Web dashboard settings
+    ENABLE_WEB_DASHBOARD: process.env.ENABLE_WEB_DASHBOARD === 'true',
+    WEB_DASHBOARD_PORT: parseInt(process.env.WEB_DASHBOARD_PORT || '3000', 10),
 };

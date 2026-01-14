@@ -7,6 +7,63 @@ const MIN_INTERVAL_MS = parseInt(process.env.WEBAPP_PUSH_INTERVAL_MS || '2000', 
 let lastPushedAt = 0;
 let pendingTimer: NodeJS.Timeout | null = null;
 
+const formatUsd = (value?: number | null): string | undefined => {
+    if (value === undefined || value === null || Number.isNaN(value)) {
+        return undefined;
+    }
+    return `$${value.toFixed(2)}`;
+};
+
+const mapTrades = (trades: AppStateSnapshot['trades'] = []) =>
+    trades.map((trade) => {
+        const timestampMs = trade.timestamp || Date.now();
+        const marketUrl = trade.marketSlug
+            ? `https://polymarket.com/event/${trade.marketSlug}`
+            : trade.marketName || '';
+        return {
+            trader: trade.traderAddress,
+            action: trade.side,
+            asset: trade.asset || trade.marketSlug || trade.marketName,
+            side: trade.side,
+            amount: formatUsd(trade.usdcSize),
+            price: trade.price,
+            market: marketUrl,
+            tx: trade.transactionHash ? `https://polygonscan.com/tx/${trade.transactionHash}` : undefined,
+            timestamp: timestampMs,
+        };
+    });
+
+const mapTraders = (traders: AppStateSnapshot['traders'] = []) =>
+    traders.map((trader) => ({
+        address: trader.address,
+        notes: trader.positionCount ? `${trader.positionCount} positions` : undefined,
+    }));
+
+const mapPortfolio = (snapshot: AppStateSnapshot) => {
+    const portfolio = snapshot.myPortfolio;
+    const balance = portfolio?.availableCash ?? 0;
+    const invested = portfolio?.investedValue ?? 0;
+    const totalValue = (portfolio?.currentValue ?? 0) + balance;
+    const pnl = totalValue - invested;
+
+    return {
+        balance,
+        totalInvested: invested,
+        totalPnL: pnl,
+        totalTrades: snapshot.trades?.length ?? 0,
+    };
+};
+
+const buildPayload = (snapshot: AppStateSnapshot) => ({
+    botName: process.env.BOT_NAME || 'EdgeBotPro',
+    updatedAt: snapshot.updatedAt,
+    myPortfolio: mapPortfolio(snapshot),
+    traders: mapTraders(snapshot.traders),
+    trades: mapTrades(snapshot.trades),
+    executions: snapshot.executions ?? [],
+    health: snapshot.health ?? {},
+});
+
 const sendPayload = async (reason: string, snapshot: AppStateSnapshot): Promise<void> => {
     const url = ENV.WEBAPP_PUSH_URL;
     if (!url) {
@@ -24,7 +81,7 @@ const sendPayload = async (reason: string, snapshot: AppStateSnapshot): Promise<
                 botId,
                 reason,
                 runtimeMode: snapshot.mode,
-                payload: snapshot,
+                payload: buildPayload(snapshot),
             },
             {
                 headers: {

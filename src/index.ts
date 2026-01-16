@@ -457,9 +457,11 @@ export const main = async () => {
 
                         setPnlHistory(pnlHistoryForAppState);
 
+                        const botId = process.env.BOT_ID || 'gabagool';
+                        const botName = process.env.BOT_NAME || 'gabagool22';
                         const payload = {
-                            botId: 'gabagool',
-                            botName: 'gabagool22',
+                            botId,
+                            botName,
                             apiKey: 'betabot-dashboard-key',
                             portfolio: {
                                 balance: 0,
@@ -893,9 +895,11 @@ export const main = async () => {
                         setMarketSummaries(marketSummariesForAppState);
                         setPnlHistory(pnlHistoryForAppState);
 
+                        const botId = process.env.BOT_ID || 'gabagool';
+                        const botName = process.env.BOT_NAME || 'gabagool22';
                         const payload = {
-                            botId: 'gabagool',
-                            botName: 'gabagool22',
+                            botId,
+                            botName,
                             apiKey: 'betabot-dashboard-key',
                             portfolio: {
                                 // Primary portfolio metrics (prefer live/open PnL to match terminal dashboard)

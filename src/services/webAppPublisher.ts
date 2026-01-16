@@ -113,7 +113,7 @@ const mapMarketSummaries = (markets: AppStateSnapshot['marketSummaries'] = []) =
     }));
 
 const buildPayload = (snapshot: AppStateSnapshot) => ({
-    botName: process.env.BOT_NAME || 'EdgeBotPro',
+    botName: process.env.BOT_NAME || 'gabagool22',
     updatedAt: snapshot.updatedAt,
     myPortfolio: mapPortfolio(snapshot),
     traders: mapTraders(snapshot.traders),
@@ -137,7 +137,7 @@ const sendPayload = async (reason: string, snapshot: AppStateSnapshot): Promise<
     pendingTimer = null;
 
     try {
-        const botId = process.env.BOT_ID || 'watcher';
+        const botId = process.env.BOT_ID || 'gabagool';
         await axios.post(
             url,
             {

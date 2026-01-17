@@ -468,8 +468,8 @@ export const main = async () => {
 
                         setPnlHistory(pnlHistoryForAppState);
 
-                        const botId = 'edgebotpro';
-                        const botName = 'EdgeBotPro';
+                        const botId = 'gaba';
+                        const botName = 'Gaba';
                         const payload = {
                             botId,
                             botName,
@@ -934,8 +934,8 @@ export const main = async () => {
                             updatedAt: Date.now(),
                         });
 
-                        const botId = 'edgebotpro';
-                        const botName = 'EdgeBotPro';
+                        const botId = 'gaba';
+                        const botName = 'Gaba';
                         const payload = {
                             botId,
                             botName,

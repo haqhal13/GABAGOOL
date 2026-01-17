@@ -557,7 +557,7 @@ export const main = async () => {
 
                 // Import appState setters for syncing data to webAppPublisher
                 const appStateModule = await import('./services/appState');
-                const { setMarketSummaries, setPnlHistory } = appStateModule;
+                const { setMarketSummaries, setPnlHistory, setPortfolioSnapshot } = appStateModule;
 
                 botMetricsInterval = setInterval(async () => {
                     try {
@@ -910,6 +910,29 @@ export const main = async () => {
 
                         setMarketSummaries(marketSummariesForAppState);
                         setPnlHistory(pnlHistoryForAppState);
+
+                        // Set portfolio with all live PnL metrics for WEBAPP
+                        setPortfolioSnapshot({
+                            wallet: '',
+                            openPositions: currentMarkets.length,
+                            investedValue: totalInvested,
+                            currentValue: totalInvested + totalPnL,
+                            availableCash: balance,
+                            overallPnl: totalPnL,
+                            totalPnL,
+                            totalPnLPercent,
+                            totalTrades,
+                            pnl15m,
+                            pnl15mPercent,
+                            trades15m,
+                            pnl1h,
+                            pnl1hPercent,
+                            trades1h,
+                            pnl5m: unrealizedPnL15m, // Using 15m as proxy for 5m for now
+                            pnl5mPercent: livePnL15mPercent,
+                            trades5m: unrealizedTrades15m,
+                            updatedAt: Date.now(),
+                        });
 
                         const botId = 'edgebotpro';
                         const botName = 'EdgeBotPro';

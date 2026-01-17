@@ -193,14 +193,16 @@ const sendPayload = async (reason: string, snapshot: AppStateSnapshot): Promise<
         // Use BOT_ID env var if set, otherwise default to 'edgebotpro'
         const botId = process.env.BOT_ID || 'edgebotpro';
         const botName = process.env.BOT_NAME || 'EdgeBotPro';
-        await axios.post(
+        const requestBody = {
+            botId,
+            reason,
+            runtimeMode: mapRuntimeMode(snapshot.mode),
+            payload: { ...buildPayload(snapshot), botName },
+        };
+
+        const response = await axios.post(
             url,
-            {
-                botId,
-                reason,
-                runtimeMode: mapRuntimeMode(snapshot.mode),
-                payload: { ...buildPayload(snapshot), botName },
-            },
+            requestBody,
             {
                 headers: {
                     'Content-Type': 'application/json',
@@ -209,9 +211,10 @@ const sendPayload = async (reason: string, snapshot: AppStateSnapshot): Promise<
                 timeout: ENV.WEBAPP_PUSH_TIMEOUT_MS,
             }
         );
+        Logger.info(`[WEBAPP] Push success: ${response.status} - botId=${botId}, reason=${reason}`);
     } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        Logger.warning(`Failed to push update to web app: ${message}`);
+        Logger.warning(`[WEBAPP] Failed to push update: ${message}`);
     }
 };
 
@@ -264,9 +267,14 @@ export const initWebAppPublisher = (): void => {
     void sendPayload('init', initialSnapshot);
 
     // Subscribe to state changes and publish updates automatically
-    subscribeToState((snapshot, reason) => {
+    subscribeToState((_snapshot, reason) => {
         publishAppState(reason);
     });
+
+    // Also send heartbeat every 1.5 seconds to keep bot visible on dashboard
+    setInterval(() => {
+        publishAppState('heartbeat');
+    }, 1500);
 };
 
 export default publishAppState;

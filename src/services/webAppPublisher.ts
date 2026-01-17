@@ -1,7 +1,7 @@
 import axios from 'axios';
 import { ENV } from '../config/env';
 import Logger from '../utils/logger';
-import { AppStateSnapshot, emitStateSnapshot, subscribeToState } from './appState';
+import { AppStateSnapshot, emitStateSnapshot, getSnapshot, subscribeToState } from './appState';
 import watchlistManager from './watchlistManager';
 
 const MIN_INTERVAL_MS = parseInt(process.env.WEBAPP_PUSH_INTERVAL_MS || '2000', 10);
@@ -273,7 +273,8 @@ export const initWebAppPublisher = (): void => {
 
     // Also send heartbeat every 1.5 seconds to keep bot visible on dashboard
     setInterval(() => {
-        publishAppState('heartbeat');
+        const snapshot = getSnapshot();
+        void sendPayload('heartbeat', snapshot);
     }, 1500);
 };
 

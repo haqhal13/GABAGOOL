@@ -438,7 +438,7 @@ export const main = async () => {
 
                 // Import appState setters for syncing data to webAppPublisher
                 const appStateModule = await import('./services/appState');
-                const { setMarketSummaries, setPnlHistory } = appStateModule;
+                const { setMarketSummaries, setPnlHistory, setPortfolioSnapshot } = appStateModule;
 
                 botMetricsInterval = setInterval(async () => {
                     try {

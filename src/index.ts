@@ -130,14 +130,20 @@ export const main = async () => {
         (process.env.PAPER_MODE !== undefined && process.env.PAPER_MODE !== '') ||
         (process.env.TRACK_ONLY_MODE !== undefined && process.env.TRACK_ONLY_MODE !== '');
 
-    const hasExplicitFlag = process.argv.some(arg => 
+    const hasExplicitFlag = process.argv.some(arg =>
         arg.includes('PAPER_MODE') || arg.includes('TRACK_ONLY_MODE')
     );
-    
-    // Show menu if no mode is explicitly set
-    if (!hasExplicitMode && !hasExplicitFlag) {
+
+    // Skip menu if SKIP_MODE_MENU is set (for automated deployments like Render)
+    const skipMenu = process.env.SKIP_MODE_MENU === 'true';
+
+    // Show menu if no mode is explicitly set and not skipping
+    if (!hasExplicitMode && !hasExplicitFlag && !skipMenu) {
         const selectedMode = await showModeMenu();
         console.log(`\n✅ Selected: ${selectedMode === 'PAPER' ? '📊 Paper Mode' : selectedMode === 'WATCH' ? '👀 Watcher Mode' : '💰 Trading Mode'}\n`);
+    } else if (skipMenu) {
+        console.log('[STARTUP] Skipping mode menu (SKIP_MODE_MENU=true)');
+        console.log(`[STARTUP] Mode: PAPER_MODE=${process.env.PAPER_MODE}, TRACK_ONLY_MODE=${process.env.TRACK_ONLY_MODE}`);
     }
     
     // NOW import all modules that use ENV (after menu has set TRACK_ONLY_MODE)

@@ -61,27 +61,63 @@ const mapPortfolio = (snapshot: AppStateSnapshot) => {
     const portfolio = snapshot.myPortfolio;
     const balance = portfolio?.availableCash ?? 0;
     const invested = portfolio?.investedValue ?? 0;
-    const totalValue = (portfolio?.currentValue ?? 0) + balance;
-    const pnl = totalValue - invested;
+    const currentValue = portfolio?.currentValue ?? 0;
+    const pnl = portfolio?.totalPnL ?? (currentValue - invested);
+    const pnlPercent = portfolio?.totalPnLPercent ?? (invested > 0 ? (pnl / invested) * 100 : 0);
 
     return {
-        balance,
-        totalInvested: invested,
+        // WEBAPP required fields
+        availableCash: balance,
+        investedValue: invested,
+        currentValue: currentValue,
         totalPnL: pnl,
-        totalTrades: snapshot.trades?.length ?? 0,
+        totalPnLPercent: pnlPercent,
+        openPositions: portfolio?.openPositions ?? (snapshot.marketSummaries?.length ?? 0),
+        totalTrades: portfolio?.totalTrades ?? (snapshot.trades?.length ?? 0),
+        // Optional wallet
+        wallet: portfolio?.wallet,
+        // Time-windowed PnL metrics
+        pnl5m: portfolio?.pnl5m,
+        pnl5mPercent: portfolio?.pnl5mPercent,
+        trades5m: portfolio?.trades5m,
+        pnl15m: portfolio?.pnl15m,
+        pnl15mPercent: portfolio?.pnl15mPercent,
+        trades15m: portfolio?.trades15m,
+        pnl1h: portfolio?.pnl1h,
+        pnl1hPercent: portfolio?.pnl1hPercent,
+        trades1h: portfolio?.trades1h,
     };
 };
 
 const mapPnlHistory = (pnlHistory: AppStateSnapshot['pnlHistory'] = []) =>
-    pnlHistory.map((entry) => ({
-        marketName: entry.marketName,
-        conditionId: entry.conditionId || '',
-        totalPnl: entry.totalPnL,
-        pnlPercent: entry.pnlPercent,
-        outcome: entry.outcome,
-        timestamp: entry.timestamp,
-        marketType: entry.marketType,
-    }));
+    pnlHistory.map((entry) => {
+        // Map internal outcome format to WEBAPP format
+        // Internal uses 'UP'/'DOWN', WEBAPP expects 'WIN'/'LOSS'/'UNKNOWN'
+        let outcome: 'WIN' | 'LOSS' | 'UNKNOWN' = 'UNKNOWN';
+        if (entry.outcome === 'UP' || entry.outcome === 'DOWN') {
+            // Determine WIN/LOSS based on PnL
+            outcome = entry.totalPnL >= 0 ? 'WIN' : 'LOSS';
+        } else if ((entry.outcome as string) === 'WIN' || (entry.outcome as string) === 'LOSS') {
+            outcome = entry.outcome as 'WIN' | 'LOSS';
+        }
+
+        return {
+            marketName: entry.marketName,
+            conditionId: entry.conditionId || '',
+            // WEBAPP schema uses lowercase 'l' in totalPnl
+            totalPnl: entry.totalPnL,
+            pnlPercent: entry.pnlPercent,
+            // Include price data for WEBAPP display
+            priceUp: (entry as any).priceUp ?? 0,
+            priceDown: (entry as any).priceDown ?? 0,
+            // Include shares data
+            sharesUp: (entry as any).sharesUp ?? 0,
+            sharesDown: (entry as any).sharesDown ?? 0,
+            timestamp: entry.timestamp,
+            outcome,
+            marketType: entry.marketType,
+        };
+    });
 
 const mapMarketSummaries = (markets: AppStateSnapshot['marketSummaries'] = []) =>
     markets.map((m) => ({
@@ -126,6 +162,24 @@ const buildPayload = (snapshot: AppStateSnapshot) => ({
     marketSummaries: mapMarketSummaries(snapshot.marketSummaries),
 });
 
+/**
+ * Map internal mode to WEBAPP runtimeMode
+ * Internal: 'TRACK_ONLY' | 'TRADING'
+ * WEBAPP expects: 'TRADING' | 'PAPER' | 'WATCHER'
+ */
+const mapRuntimeMode = (internalMode: string): 'TRADING' | 'PAPER' | 'WATCHER' => {
+    // Check if PAPER_MODE is enabled
+    if (ENV.PAPER_MODE) {
+        return 'PAPER';
+    }
+    // Map TRACK_ONLY to WATCHER
+    if (internalMode === 'TRACK_ONLY') {
+        return 'WATCHER';
+    }
+    // Default to TRADING
+    return 'TRADING';
+};
+
 const sendPayload = async (reason: string, snapshot: AppStateSnapshot): Promise<void> => {
     const url = ENV.WEBAPP_PUSH_URL;
     if (!url) {
@@ -136,14 +190,16 @@ const sendPayload = async (reason: string, snapshot: AppStateSnapshot): Promise<
     pendingTimer = null;
 
     try {
-        const botId = 'edgebotpro';
+        // Use BOT_ID env var if set, otherwise default to 'edgebotpro'
+        const botId = process.env.BOT_ID || 'edgebotpro';
+        const botName = process.env.BOT_NAME || 'EdgeBotPro';
         await axios.post(
             url,
             {
                 botId,
                 reason,
-                runtimeMode: snapshot.mode,
-                payload: buildPayload(snapshot),
+                runtimeMode: mapRuntimeMode(snapshot.mode),
+                payload: { ...buildPayload(snapshot), botName },
             },
             {
                 headers: {

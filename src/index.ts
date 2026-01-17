@@ -454,10 +454,15 @@ export const main = async () => {
                                 marketName: entry.marketName,
                                 totalPnL: entry.totalPnl,
                                 pnlPercent: entry.pnlPercent,
-                                outcome: entry.outcome as 'UP' | 'DOWN',
+                                outcome: entry.outcome as 'UP' | 'DOWN' | 'WIN' | 'LOSS',
                                 timestamp: entry.timestamp,
                                 marketType,
                                 conditionId: entry.conditionId || '',
+                                // Include price/shares data for WEBAPP
+                                priceUp: entry.priceUp,
+                                priceDown: entry.priceDown,
+                                sharesUp: entry.sharesUp,
+                                sharesDown: entry.sharesDown,
                             };
                         });
 
@@ -891,10 +896,15 @@ export const main = async () => {
                                 marketName: entry.marketName,
                                 totalPnL: entry.totalPnl,
                                 pnlPercent: entry.pnlPercent,
-                                outcome: entry.outcome as 'UP' | 'DOWN',
+                                outcome: entry.outcome as 'UP' | 'DOWN' | 'WIN' | 'LOSS',
                                 timestamp: entry.timestamp,
                                 marketType,
                                 conditionId: entry.conditionId || '',
+                                // Include price/shares data for WEBAPP
+                                priceUp: entry.priceUp,
+                                priceDown: entry.priceDown,
+                                sharesUp: entry.sharesUp,
+                                sharesDown: entry.sharesDown,
                             };
                         });
 

@@ -408,9 +408,14 @@ export const ENV = {
     MONGO_URI: process.env.MONGO_URI as string,
     RPC_URL: process.env.RPC_URL as string,
     USDC_CONTRACT_ADDRESS: process.env.USDC_CONTRACT_ADDRESS as string,
-    WEBAPP_PUSH_URL: process.env.WEBAPP_PUSH_URL || '',
-    WEBAPP_API_KEY: process.env.WEBAPP_API_KEY || '',
+    // Support both WEBAPP_PUSH_URL and EXTERNAL_WEBAPP_URL (for compatibility)
+    WEBAPP_PUSH_URL: process.env.WEBAPP_PUSH_URL || process.env.EXTERNAL_WEBAPP_URL || '',
+    // Support both WEBAPP_API_KEY and EXTERNAL_WEBAPP_API_KEY
+    WEBAPP_API_KEY: process.env.WEBAPP_API_KEY || process.env.EXTERNAL_WEBAPP_API_KEY || '',
     WEBAPP_PUSH_TIMEOUT_MS: parseInt(process.env.WEBAPP_PUSH_TIMEOUT_MS || '5000', 10),
+    // EXTERNAL_WEBAPP_ENABLED can be used to explicitly enable/disable
+    EXTERNAL_WEBAPP_ENABLED: process.env.EXTERNAL_WEBAPP_ENABLED === 'true' ||
+        !!(process.env.WEBAPP_PUSH_URL || process.env.EXTERNAL_WEBAPP_URL),
     // Web dashboard settings
     ENABLE_WEB_DASHBOARD: process.env.ENABLE_WEB_DASHBOARD === 'true',
     WEB_DASHBOARD_PORT: parseInt(process.env.WEB_DASHBOARD_PORT || '3000', 10),

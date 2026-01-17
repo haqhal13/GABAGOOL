@@ -87,10 +87,15 @@ export interface PnlHistoryEntry {
     marketName: string;
     totalPnL: number;
     pnlPercent: number;
-    outcome: 'UP' | 'DOWN';
+    outcome: 'UP' | 'DOWN' | 'WIN' | 'LOSS';
     timestamp: number;
     marketType: '5m' | '15m' | '1h' | 'OTHER';
     conditionId: string;
+    // Additional fields for WEBAPP compatibility
+    priceUp?: number;
+    priceDown?: number;
+    sharesUp?: number;
+    sharesDown?: number;
 }
 
 export interface AppStateSnapshot {

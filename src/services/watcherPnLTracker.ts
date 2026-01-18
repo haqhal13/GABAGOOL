@@ -100,12 +100,20 @@ class WatcherPnLTracker {
                 const data = fs.readFileSync(this.pnlHistoryFilePath, 'utf8');
                 const parsed = JSON.parse(data);
 
-                // Convert array back to Map
+                // Handle both old format (array) and new format (object with investment metrics)
                 if (Array.isArray(parsed)) {
+                    // Old format - just PnL history array
                     this.marketPnLData = new Map(parsed.map(item => [item.conditionId || item.marketKey, item]));
-                    // Also restore loggedMarkets to prevent duplicates
                     this.loggedMarkets = new Set(parsed.map(item => item.conditionId || item.marketKey));
-                    Logger.info(`Loaded ${this.marketPnLData.size} PnL history entries from disk`);
+                    Logger.info(`Loaded ${this.marketPnLData.size} PnL history entries from disk (old format)`);
+                } else {
+                    // New format - includes investment metrics
+                    const pnlHistory = parsed.pnlHistory || [];
+                    this.marketPnLData = new Map(pnlHistory.map((item: any) => [item.conditionId || item.marketKey, item]));
+                    this.loggedMarkets = new Set(pnlHistory.map((item: any) => item.conditionId || item.marketKey));
+                    this.investmentSnapshots = parsed.investmentSnapshots || [];
+                    this.peakConcurrentInvestment = parsed.peakConcurrentInvestment || 0;
+                    Logger.info(`Loaded ${this.marketPnLData.size} PnL history entries, peak invested: $${this.peakConcurrentInvestment.toFixed(2)}`);
                 }
             }
         } catch (error) {
@@ -114,12 +122,16 @@ class WatcherPnLTracker {
     }
 
     /**
-     * Save PnL history to persistent JSON file
+     * Save PnL history to persistent JSON file (includes investment metrics)
      */
     private savePnLHistory(): void {
         try {
-            const data = Array.from(this.marketPnLData.values());
-            fs.writeFileSync(this.pnlHistoryFilePath, JSON.stringify(data, null, 2), 'utf8');
+            const saveData = {
+                pnlHistory: Array.from(this.marketPnLData.values()),
+                investmentSnapshots: this.investmentSnapshots.slice(-100), // Keep last 100 snapshots
+                peakConcurrentInvestment: this.peakConcurrentInvestment,
+            };
+            fs.writeFileSync(this.pnlHistoryFilePath, JSON.stringify(saveData, null, 2), 'utf8');
         } catch (error) {
             Logger.error(`Failed to save PnL history: ${error}`);
         }
